@@ -69,11 +69,15 @@ function decodeIv(anyIv) {
 
 const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i=0;i<buf.length;i++) o[i]=buf[i]^0xff; return o; };
 
-function gcmEncryptToB64(key, iv, obj) {
+/** encrypts string OR object (object will be JSON.stringified) */
+function gcmEncryptToB64(key, iv, payload) {
   const bits = key.length * 8;
   const cipher = crypto.createCipheriv(`aes-${bits}-gcm`, key, iv);
-  const payload = Buffer.from(JSON.stringify(obj), "utf8");
-  const ct = Buffer.concat([cipher.update(payload), cipher.final()]);
+  const data =
+    typeof payload === "string"
+      ? Buffer.from(payload, "utf8")
+      : Buffer.from(JSON.stringify(payload), "utf8");
+  const ct = Buffer.concat([cipher.update(data), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([ct, tag]).toString("base64"); // cipher||tag
 }
@@ -122,7 +126,6 @@ export default async function handler(req, res) {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).end();
 
-    // Parse
     const bodyStr = await readBody(req);
     let body = {};
     try { body = JSON.parse(bodyStr); } catch { body = {}; }
@@ -137,7 +140,7 @@ export default async function handler(req, res) {
       log("FLOW: body.data keys", Object.keys(body.data));
     }
 
-    // Ignore Data API pings not wrapped in crypto
+    // Ignore plaintext Data API ping (Connect Meta app)
     if (body?.action === "ping" && !body?.encrypted_aes_key && !body?.encrypted_flow_data) {
       log("FLOW: plaintext ping -> 200");
       return res.status(200).end();
@@ -160,21 +163,21 @@ export default async function handler(req, res) {
       ivLen: ivBuf ? ivBuf.length : null
     });
 
-    // If no encrypted_flow_data, treat as Health Check: always return encrypted {"ok":true}
+    // The HC payload your tenant expects:
+    const HC_OK_OBJECT = { data: { status: "active" } };
+
+    // Health check (no encrypted_flow_data) → ENCRYPT that object
     if (!flow) {
-      if (aesKey && ivBuf) {
-        const reply = gcmEncryptToB64(aesKey, invert(ivBuf), { ok: true });
-        log("FLOW: HC ENCRYPTED reply len", reply.length);
-        log("FLOW: HC done in ms", Date.now() - t0);
-        return sendB64(res, reply);
-      }
-      const fallback = Buffer.from("ok").toString("base64");
-      log("FLOW: HC FALLBACK", fallback);
+      const reply =
+        aesKey && ivBuf
+          ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK_OBJECT)
+          : Buffer.from(JSON.stringify(HC_OK_OBJECT)).toString("base64");
+      log("FLOW: HC reply len", reply.length);
       log("FLOW: HC done in ms", Date.now() - t0);
-      return sendB64(res, fallback);
+      return sendB64(res, reply);
     }
 
-    // encrypted_flow_data present → decrypt first
+    // encrypted_flow_data present → decrypt
     let clean = {};
     try {
       if (aesKey && ivBuf) {
@@ -182,26 +185,24 @@ export default async function handler(req, res) {
         log("FLOW: decrypted keys", Object.keys(clean || {}));
       } else {
         log("FLOW: cannot decrypt (missing materials)");
-        clean = body;
+        clean = {};
       }
     } catch (e) {
       log("FLOW: decrypt error", e?.message || e);
       clean = {};
     }
 
-    // 🔑 NEW: if decrypted payload is a probe (ping/health_check), return ENCRYPTED Base64
+    // If probe wrapped in crypto, return ENCRYPTED HC_OK_OBJECT
     if (clean && (clean.action === "ping" || clean.action === "health_check")) {
-      if (aesKey && ivBuf) {
-        const reply = gcmEncryptToB64(aesKey, invert(ivBuf), { ok: true });
-        log("FLOW: PROBE reply (encrypted) len", reply.length, "action", clean.action);
-        return sendB64(res, reply);
-      }
-      const fallback = Buffer.from("ok").toString("base64");
-      log("FLOW: PROBE fallback (no materials)", fallback);
-      return sendB64(res, fallback);
+      const reply =
+        aesKey && ivBuf
+          ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK_OBJECT)
+          : Buffer.from(JSON.stringify(HC_OK_OBJECT)).toString("base64");
+      log("FLOW: PROBE reply (encrypted) len", reply.length, "action", clean.action);
+      return sendB64(res, reply);
     }
 
-    // Otherwise it's real data_exchange → forward (optional) and ACK
+    // Otherwise forward (optional) and ack
     try {
       if (process.env.MAKE_WEBHOOK_URL) {
         const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -219,7 +220,8 @@ export default async function handler(req, res) {
     return res.status(200).end();
   } catch (e) {
     log("FLOW: handler error", e?.message || e);
-    // keep HC happy on unexpected errors
-    return sendB64(res, Buffer.from("ok").toString("base64"));
+    // keep HC happy on unexpected errors — respond with the expected object, Base64
+    const fallback = Buffer.from(JSON.stringify({ data: { status: "active" } })).toString("base64");
+    return sendB64(res, fallback);
   }
 }

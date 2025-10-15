@@ -1,8 +1,11 @@
 {
   "name": "wa-flows-endpoint",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
   "dependencies": {
     "body-parser": "^1.20.2",
     "express": "^4.19.2",

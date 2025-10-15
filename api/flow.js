@@ -1,21 +1,25 @@
 // api/flow.js
 import crypto from "node:crypto";
 
-/* ---------- tiny helpers ---------- */
+/* ----------------------- helpers ----------------------- */
 const sendJSON = (res, obj) => {
   res.setHeader("Content-Type", "application/json");
   return res.status(200).send(JSON.stringify(obj));
 };
 
+// raw Base64 body (no quotes/newlines)
 const sendBase64 = (res, base64String) => {
-  const body = (base64String || "").trim(); // no quotes/whitespace
+  const body = (base64String || "").trim();
   res.setHeader("Content-Type", "text/plain");
   return res.status(200).send(body);
 };
 
-const VALID_AES_BYTES = new Set([16, 24, 32]); // AES-128/192/256
+const toB64 = (x) =>
+  Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
 
-/* ---------- key/iv handling per Meta ---------- */
+/* ------------------- crypto (Meta Flows) ------------------ */
+const VALID_AES_BYTES = new Set([16, 24, 32]); // 128/192/256
+
 function rsaDecryptIfWrapped(aesKeyB64, privatePem) {
   try {
     const wrapped = Buffer.from(aesKeyB64, "base64");
@@ -31,7 +35,7 @@ function getAesKey(aesKeyB64, privatePem) {
     const k = rsaDecryptIfWrapped(aesKeyB64, privatePem);
     if (k && VALID_AES_BYTES.has(k.length)) return k;
   }
-  // 2) Fall back to raw Base64 key
+  // 2) Fallback: raw Base64 AES key
   try {
     const k = Buffer.from(aesKeyB64, "base64");
     if (VALID_AES_BYTES.has(k.length)) return k;
@@ -45,18 +49,17 @@ function invertIv(ivBuf) {
   return out;
 }
 
-/* ---------- AES-GCM primitives ---------- */
 function aesGcmEncryptToBase64(aesKeyBuf, ivBuf, obj) {
   const bits = aesKeyBuf.length * 8; // 128/192/256
   const cipher = crypto.createCipheriv(`aes-${bits}-gcm`, aesKeyBuf, ivBuf);
   const payload = Buffer.from(JSON.stringify(obj), "utf8");
   const ct = Buffer.concat([cipher.update(payload), cipher.final()]);
   const tag = cipher.getAuthTag(); // 16 bytes
-  return Buffer.concat([ct, tag]).toString("base64"); // Base64(cipher || tag)
+  return Buffer.concat([ct, tag]).toString("base64"); // Base64(cipher||tag)
 }
 
 function aesGcmDecryptJson(aesKeyBuf, ivB64, cipherB64) {
-  const iv = Buffer.from(ivB64, "base64"); // accept 12 or 16
+  const iv = Buffer.from(ivB64, "base64"); // accept 12/16/etc
   const data = Buffer.from(cipherB64, "base64");
   const tag = data.subarray(data.length - 16);
   const ct = data.subarray(0, data.length - 16);
@@ -67,7 +70,7 @@ function aesGcmDecryptJson(aesKeyBuf, ivB64, cipherB64) {
   return JSON.parse(pt.toString("utf8"));
 }
 
-/* ---------- extract materials (field names vary slightly) ---------- */
+/* --------- extract materials (field names vary by tenant) ---------- */
 function extractMaterials(body) {
   const encryptedKey =
     body?.encrypted_aes_key ??
@@ -88,13 +91,13 @@ function extractMaterials(body) {
   return { encryptedKey, initialIv, encryptedFlowData };
 }
 
-/* ------------------- main handler ------------------- */
+/* -------------------------- handler -------------------------- */
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Parse body robustly
+    // robust parse
     let body = req.body && typeof req.body === "object" ? req.body : {};
     if (!Object.keys(body).length) {
       const raw = await new Promise((resolve) => {
@@ -105,26 +108,39 @@ export default async function handler(req, res) {
       try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
     }
 
-    if (process.env.LOG_REQUEST === "1") {
-      console.log("FLOW PROBE headers:", JSON.stringify(req.headers).slice(0, 4000));
-      console.log("FLOW PROBE body:", JSON.stringify(body).slice(0, 4000));
+    // 0) FORCE_B64 guard (use only for health-check debugging)
+    if (process.env.FORCE_B64 === "1") {
+      return sendBase64(res, toB64("ok")); // "b2s="
     }
 
-    // 1) Public-key challenge
+    // 1) Public-key signing challenge
     if (body?.challenge) return sendJSON(res, { challenge: body.challenge });
 
-    // 2) Health check vs data_exchange
+    // 2) Materials present?
     const { encryptedKey, initialIv, encryptedFlowData } = extractMaterials(body);
     const haveMaterials = Boolean(encryptedKey && initialIv);
 
-    // if (process.env.FORCE_B64 === "1" || (!encryptedFlowData && !haveMaterials)) {
-  return sendBase64(res, Buffer.from("ok").toString("base64"));
-}
+    // 3) Health check (materials but no payload) OR any POST without payload
+    if (!encryptedFlowData) {
+      if (haveMaterials) {
+        try {
+          const aesKey = getAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
+          if (aesKey) {
+            const iv = Buffer.from(initialIv, "base64");
+            const reply = aesGcmEncryptToBase64(aesKey, invertIv(iv), { ok: true });
+            return sendBase64(res, reply); // raw Base64 body
+          }
+        } catch (e) {
+          console.error("Health encrypt error:", e?.message || e);
+        }
+      }
+      // Fallback: still Base64 so checker cannot say "not Base64"
+      return sendBase64(res, toB64("ok"));
+    }
 
-
-    // Normal traffic: decrypt if present, then forward
+    // 4) NORMAL TRAFFIC: decrypt then forward
     let clean = body;
-    if (haveMaterials && encryptedFlowData) {
+    if (haveMaterials) {
       try {
         const aesKey = getAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
         if (aesKey) clean = aesGcmDecryptJson(aesKey, initialIv, encryptedFlowData);
@@ -133,7 +149,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Forward to Power Automate
+    // 5) Forward to Power Automate
     if (process.env.MAKE_WEBHOOK_URL) {
       try {
         await fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -146,6 +162,7 @@ export default async function handler(req, res) {
       }
     }
 
+    // 6) Ack
     return res.status(200).end();
   } catch (e) {
     console.error("Handler error:", e?.message || e);

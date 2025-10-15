@@ -107,7 +107,7 @@ function getMaterials(b) {
 
 /* --------------- flow logic --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
-const START_SCREEN_ID = "ask_nps"; // <- your start screen
+const START_SCREEN_ID = "ask_nps"; // your start screen
 
 function decideNextScreen(clean) {
   const scr = clean?.screen;
@@ -187,13 +187,9 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // --- RUNTIME START PING: no screen provided → navigate to first screen
+    // ---------- RUNTIME START PING (no screen) -> navigate to first screen ----------
     if (clean && clean.action === "ping" && !clean.screen) {
-      const payload = {
-        version: clean?.version || "3.0",
-        screen: START_SCREEN_ID,
-        data: {}
-      };
+      const payload = { version: clean?.version || "3.0", screen: START_SCREEN_ID, data: {} };
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
@@ -201,7 +197,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Encrypted health_check (explicit)
+    // ---------- Encrypted health_check probe ----------
     if (clean && clean.action === "health_check") {
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK)
@@ -210,13 +206,19 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // If the *request* came from a terminal screen (Finish button), close now
+    // ---------- RECOVER: client "navigate" error callback (e.g., stale screen ids) ----------
+    if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
+      const payload = { version: clean?.version || "3.0", screen: START_SCREEN_ID, data: {} };
+      const reply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+        : Buffer.from(JSON.stringify(payload)).toString("base64");
+      log("FLOW: RECOVER navigate-error →", START_SCREEN_ID);
+      return sendB64(res, reply);
+    }
+
+    // ---------- Terminal request (user tapped Finish) -> close flow ----------
     if (TERMINAL_SCREENS.has(clean?.screen)) {
-      const closePayload = {
-        version: clean?.version || "3.0",
-        data: { status: "success" },
-        close_flow: true
-      };
+      const closePayload = { version: clean?.version || "3.0", data: { status: "success" }, close_flow: true };
       const closeReply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), closePayload)
         : Buffer.from(JSON.stringify(closePayload)).toString("base64");
@@ -224,7 +226,7 @@ export default async function handler(req, res) {
       return sendB64(res, closeReply);
     }
 
-    // Otherwise compute next; if next is terminal, end immediately
+    // ---------- Normal navigate ----------
     const next = decideNextScreen(clean);
     const nextIsTerminal = TERMINAL_SCREENS.has(next);
 

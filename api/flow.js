@@ -118,6 +118,35 @@ function getMaterials(body) {
   return { key, iv, flow };
 }
 
+/* --------------- navigation helper --------------- */
+/** Return the next screen id (string) based on the decrypted payload */
+function decideNextScreen(clean) {
+  const screen = clean?.screen;
+  const data = clean?.data || {};
+
+  // Screen: ask_experience  -> Yes -> ask_nps,  No -> end_no
+  if (screen === "ask_experience") {
+    if (data.consent === "yes_experience") return "ask_nps";
+    if (data.consent === "no_experience")  return "end_no";
+  }
+
+  // Screen: ask_nps -> score >= 8 -> end_positive ; else -> discuss_invite
+  if (screen === "ask_nps") {
+    const s = Number(data.score ?? data.nps_score ?? "-1");
+    if (!Number.isNaN(s) && s >= 8) return "end_positive";
+    return "discuss_invite";
+  }
+
+  // Screen: discuss_invite  -> discuss_yes -> end_discuss_yes ; discuss_no -> end_no
+  if (screen === "discuss_invite") {
+    if (data.discuss === "discuss_yes") return "end_discuss_yes";
+    if (data.discuss === "discuss_no")  return "end_no";
+  }
+
+  // Fallback: stay on same screen to avoid client error
+  return screen || "ask_experience";
+}
+
 /* -------------------------- main handler -------------------------- */
 export default async function handler(req, res) {
   const t0 = Date.now();
@@ -162,10 +191,8 @@ export default async function handler(req, res) {
       ivLen: ivBuf ? ivBuf.length : null
     });
 
-    // The HC payload your tenant expects:
+    // Health check (no encrypted_flow_data) → ENCRYPT {"data":{"status":"active"}}
     const HC_OK_OBJECT = { data: { status: "active" } };
-
-    // Health check (no encrypted_flow_data) → ENCRYPT that object
     if (!flow) {
       const reply =
         aesKey && ivBuf
@@ -182,7 +209,6 @@ export default async function handler(req, res) {
       if (aesKey && ivBuf) {
         clean = gcmDecryptJson(aesKey, ivBuf, flow);
         log("FLOW: decrypted keys", Object.keys(clean || {}));
-        // Also preview the decrypted payload for mapping (remove later if noisy)
         try { log("FLOW: decrypted payload preview", JSON.stringify(clean).slice(0, 1500)); } catch {}
       } else {
         log("FLOW: cannot decrypt (missing materials)");
@@ -193,7 +219,7 @@ export default async function handler(req, res) {
       clean = {};
     }
 
-    // If probe (ping/health_check) when wrapped, return ENCRYPTED HC_OK_OBJECT
+    // Probe wrapped in crypto? (Return HC ok)
     if (clean && (clean.action === "ping" || clean.action === "health_check")) {
       const reply =
         aesKey && ivBuf
@@ -203,19 +229,26 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    /* ---------- DATA EXCHANGE HANDLING (real user actions) ---------- */
-    // Minimal success envelope almost all tenants accept:
-    const SUCCESS_OBJECT = { data: { status: "success" } };
+    /* ---------- DATA EXCHANGE: compute next screen & return navigate ---------- */
+    const nextScreen = decideNextScreen(clean);
+    const navigatePayload = {
+      version: clean?.version || "3.0",
+      screen: nextScreen,
+      // You can pass data to next screen here if needed:
+      data: {}
+      // Optional flags supported by many tenants:
+      // close_flow: false,
+      // error_message: undefined
+    };
 
-    // Respond to the client FIRST with encrypted success so UI continues…
-    const successReply =
+    const reply =
       aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), SUCCESS_OBJECT)
-        : Buffer.from(JSON.stringify(SUCCESS_OBJECT)).toString("base64");
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), navigatePayload)
+        : Buffer.from(JSON.stringify(navigatePayload)).toString("base64");
 
-    log("FLOW: DATA_EXCHANGE reply (encrypted) len", successReply.length);
+    log("FLOW: NAVIGATE →", nextScreen, "replyLen", reply.length);
 
-    // …then forward to Power Automate in the background (non-blocking)
+    // Fire-and-forget forward to Power Automate
     try {
       if (process.env.MAKE_WEBHOOK_URL) {
         fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -226,10 +259,10 @@ export default async function handler(req, res) {
       }
     } catch {/* ignore */}
 
-    return sendB64(res, successReply);
+    return sendB64(res, reply);
   } catch (e) {
     log("FLOW: handler error", e?.message || e);
-    // keep HC/UX happy on unexpected errors — respond with success envelope
+    // Safety: keep client alive
     const fallback = Buffer.from(JSON.stringify({ data: { status: "success" } })).toString("base64");
     return sendB64(res, fallback);
   }

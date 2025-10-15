@@ -1,163 +1,141 @@
 // api/flow.js
 import crypto from "node:crypto";
 
-/* --------------------- logging --------------------- */
+/* ---------------- logging ---------------- */
 const LOG_ON = process.env.LOG_REQUEST !== "0";
-const log = (...args) => { if (LOG_ON) console.log(...args); };
+const log = (...a) => { if (LOG_ON) console.log(...a); };
 
-/* ---------------- responders ---------------- */
+/* --------------- helpers ---------------- */
 const sendJSON = (res, obj) => {
   res.setHeader("Content-Type", "application/json");
   return res.status(200).end(JSON.stringify(obj));
 };
 const sendB64 = (res, b64) => {
-  const body = (b64 || "").trim();
   res.setHeader("Content-Type", "application/octet-stream");
   res.setHeader("Cache-Control", "no-store");
-  return res.status(200).end(body);
+  return res.status(200).end((b64 || "").trim());
 };
-
-/* --------------- raw body reader --------------- */
 async function readBody(req) {
   return await new Promise((resolve) => {
-    let data = "";
+    let s = "";
     req.setEncoding("utf8");
-    req.on("data", (c) => (data += c));
-    req.on("end", () => resolve(data || "{}"));
+    req.on("data", (c) => (s += c));
+    req.on("end", () => resolve(s || "{}"));
   });
 }
 
-/* --------------- crypto helpers --------------- */
+/* --------------- crypto ------------------ */
 const VALID_AES = new Set([16, 24, 32]); // bytes (128/192/256)
 const TAG_LEN = 16;
 
-const isHex  = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
+const isHex = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
 const fromB64 = (s) => { try { const b = Buffer.from(s, "base64"); return b.length ? b : null; } catch { return null; } };
 const fromHex = (s) => (isHex(s) ? Buffer.from(s, "hex") : null);
 
-function deriveAesKey(anyKey, privatePem) {
-  // 1) RSA-OAEP-SHA256 wrapped
-  const wrapped = fromB64(anyKey);
-  if (wrapped && privatePem) {
+function deriveAesKey(k, pem) {
+  const wrapped = fromB64(k);
+  if (wrapped && pem) {
     try {
-      const k = crypto.privateDecrypt({ key: privatePem, oaepHash: "sha256" }, wrapped);
-      if (VALID_AES.has(k.length)) return k;
+      const d = crypto.privateDecrypt({ key: pem, oaepHash: "sha256" }, wrapped);
+      if (VALID_AES.has(d.length)) return d;
     } catch {}
   }
-  // 2) raw base64
   if (wrapped && VALID_AES.has(wrapped.length)) return wrapped;
-  // 3) hex
-  const hx = fromHex(anyKey);
+  const hx = fromHex(k);
   if (hx && VALID_AES.has(hx.length)) return hx;
-  // 4) utf8 (fallback)
-  if (typeof anyKey === "string") {
-    const raw = Buffer.from(anyKey, "utf8");
+  if (typeof k === "string") {
+    const raw = Buffer.from(k, "utf8");
     if (VALID_AES.has(raw.length)) return raw;
   }
   return null;
 }
-
-function decodeIv(anyIv) {
-  const b64 = fromB64(anyIv); if (b64 && (b64.length === 12 || b64.length === 16)) return b64;
-  const hx  = fromHex(anyIv); if (hx  && (hx.length  === 12 || hx.length  === 16)) return hx;
-  if (typeof anyIv === "string") {
-    const raw = Buffer.from(anyIv, "utf8");
+function decodeIv(iv) {
+  const b64 = fromB64(iv); if (b64 && (b64.length === 12 || b64.length === 16)) return b64;
+  const hx  = fromHex(iv); if (hx  && (hx.length  === 12 || hx.length  === 16)) return hx;
+  if (typeof iv === "string") {
+    const raw = Buffer.from(iv, "utf8");
     if (raw.length === 12 || raw.length === 16) return raw;
   }
   return null;
 }
-
 const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i=0;i<buf.length;i++) o[i]=buf[i]^0xff; return o; };
 
 function gcmEncryptToB64(key, iv, payload) {
   const bits = key.length * 8;
-  const cipher = crypto.createCipheriv(`aes-${bits}-gcm`, key, iv);
-  const data =
-    typeof payload === "string"
-      ? Buffer.from(payload, "utf8")
-      : Buffer.from(JSON.stringify(payload), "utf8");
-  const ct = Buffer.concat([cipher.update(data), cipher.final()]);
-  const tag = cipher.getAuthTag();
+  const c = crypto.createCipheriv(`aes-${bits}-gcm`, key, iv);
+  const data = Buffer.from(typeof payload === "string" ? payload : JSON.stringify(payload), "utf8");
+  const ct = Buffer.concat([c.update(data), c.final()]);
+  const tag = c.getAuthTag();
   return Buffer.concat([ct, tag]).toString("base64");
 }
-
-function gcmDecryptJson(key, iv, cipherPlusTagB64) {
-  const data = Buffer.from(cipherPlusTagB64, "base64");
+function gcmDecryptJson(key, iv, b64) {
+  const data = Buffer.from(b64, "base64");
   if (data.length <= TAG_LEN) throw new Error("cipher too short");
   const tag = data.subarray(data.length - TAG_LEN);
   const ct  = data.subarray(0, data.length - TAG_LEN);
   const bits = key.length * 8;
-  const dec = crypto.createDecipheriv(`aes-${bits}-gcm`, key, iv);
-  dec.setAuthTag(tag);
-  const pt = Buffer.concat([dec.update(ct), dec.final()]);
+  const d = crypto.createDecipheriv(`aes-${bits}-gcm`, key, iv);
+  d.setAuthTag(tag);
+  const pt = Buffer.concat([d.update(ct), d.final()]);
   return JSON.parse(pt.toString("utf8"));
 }
 
-/* --------------- materials extractor --------------- */
-function getMaterials(body) {
+/* --------------- request materials --------------- */
+function getMaterials(b) {
   const key =
-    body?.encrypted_aes_key ??
-    body?.encrypted_session_key ??
-    body?.encrypted_key ??
-    body?.aes_key ??
-    body?.data?.encrypted_aes_key ??
-    body?.data?.encrypted_session_key ??
-    body?.data?.aes_key;
+    b?.encrypted_aes_key ??
+    b?.encrypted_session_key ??
+    b?.encrypted_key ??
+    b?.aes_key ??
+    b?.data?.encrypted_aes_key ??
+    b?.data?.encrypted_session_key ??
+    b?.data?.aes_key;
 
   const iv =
-    body?.initial_vector ??
-    body?.initial_iv ??
-    body?.iv ??
-    body?.data?.initial_vector ??
-    body?.data?.iv;
+    b?.initial_vector ??
+    b?.initial_iv ??
+    b?.iv ??
+    b?.data?.initial_vector ??
+    b?.data?.iv;
 
   const flow =
-    body?.encrypted_flow_data ??
-    body?.data?.encrypted_flow_data;
+    b?.encrypted_flow_data ??
+    b?.data?.encrypted_flow_data;
 
   return { key, iv, flow };
 }
 
-/* --------------- navigation helpers --------------- */
+/* --------------- flow logic --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
 
 function decideNextScreen(clean) {
-  const screen = clean?.screen;
-  const data = clean?.data || {};
+  const scr = clean?.screen;
+  const d = clean?.data || {};
 
-  // ask_experience: Yes -> ask_nps, No -> end_no
-  if (screen === "ask_experience") {
-    if (data.consent === "yes_experience") return "ask_nps";
-    if (data.consent === "no_experience")  return "end_no";
-  }
-
-  // ask_nps: score >= 8 -> end_positive ; else -> discuss_invite
-  if (screen === "ask_nps") {
-    const s = Number(data.score ?? data.nps_score ?? "-1");
+  // Start is ask_nps
+  if (scr === "ask_nps") {
+    const s = Number(d.score ?? d.nps_score ?? "-1");
     if (!Number.isNaN(s) && s >= 8) return "end_positive";
     return "discuss_invite";
   }
 
-  // discuss_invite: Yes -> end_discuss_yes ; No -> end_no
-  if (screen === "discuss_invite") {
-    if (data.discuss === "discuss_yes") return "end_discuss_yes";
-    if (data.discuss === "discuss_no")  return "end_no";
+  if (scr === "discuss_invite") {
+    if (d.discuss === "discuss_yes") return "end_discuss_yes";
+    if (d.discuss === "discuss_no")  return "end_no";
   }
 
-  // Fallback
-  return screen || "ask_experience";
+  return scr || "ask_nps";
 }
 
-/* -------------------------- main handler -------------------------- */
+/* ------------------- handler ------------------- */
 export default async function handler(req, res) {
-  const t0 = Date.now();
   try {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).end();
 
     const bodyStr = await readBody(req);
     let body = {};
-    try { body = JSON.parse(bodyStr); } catch { body = {}; }
+    try { body = JSON.parse(bodyStr); } catch {}
 
     log("FLOW: recv", {
       method: req.method, url: req.url,
@@ -165,17 +143,14 @@ export default async function handler(req, res) {
       contentLength: req.headers["content-length"]
     });
     log("FLOW: body keys", Object.keys(body || {}));
-    if (body?.data && typeof body.data === "object") {
-      log("FLOW: body.data keys", Object.keys(body.data));
-    }
 
-    // Ignore plaintext Data API ping during "Connect Meta app"
+    // Plain ping from "Connect Meta app"
     if (body?.action === "ping" && !body?.encrypted_aes_key && !body?.encrypted_flow_data) {
       log("FLOW: plaintext ping -> 200");
       return res.status(200).end();
     }
 
-    // Public-key signing challenge
+    // Key-signing challenge
     if (typeof body.challenge === "string") {
       log("FLOW: challenge echo");
       return sendJSON(res, { challenge: body.challenge });
@@ -188,19 +163,15 @@ export default async function handler(req, res) {
 
     log("FLOW: materials", {
       hasEncryptedFlowData: !!flow, hasEncryptedKey: !!key, hasIV: !!iv,
-      aesKeyLen: aesKey ? aesKey.length : null,
-      ivLen: ivBuf ? ivBuf.length : null
+      aesKeyLen: aesKey?.length || null, ivLen: ivBuf?.length || null
     });
 
-    // Health check (no encrypted_flow_data) -> encrypted {"data":{"status":"active"}}
-    const HC_OK_OBJECT = { data: { status: "active" } };
+    // Health check (no encrypted_flow_data)
+    const HC_OK = { data: { status: "active" } };
     if (!flow) {
-      const reply =
-        aesKey && ivBuf
-          ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK_OBJECT)
-          : Buffer.from(JSON.stringify(HC_OK_OBJECT)).toString("base64");
-      log("FLOW: HC reply len", reply.length);
-      log("FLOW: HC done in ms", Date.now() - t0);
+      const reply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK)
+        : Buffer.from(JSON.stringify(HC_OK)).toString("base64");
       return sendB64(res, reply);
     }
 
@@ -213,66 +184,48 @@ export default async function handler(req, res) {
         try { log("FLOW: decrypted payload preview", JSON.stringify(clean).slice(0, 1500)); } catch {}
       } else {
         log("FLOW: cannot decrypt (missing materials)");
-        clean = {};
       }
     } catch (e) {
       log("FLOW: decrypt error", e?.message || e);
-      clean = {};
     }
 
-    // Probe wrapped in crypto? -> return HC ok
+    // Encrypted probe
     if (clean && (clean.action === "ping" || clean.action === "health_check")) {
-      const reply =
-        aesKey && ivBuf
-          ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK_OBJECT)
-          : Buffer.from(JSON.stringify(HC_OK_OBJECT)).toString("base64");
-      log("FLOW: PROBE reply (encrypted) len", reply.length, "action", clean.action);
+      const reply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK)
+        : Buffer.from(JSON.stringify(HC_OK)).toString("base64");
       return sendB64(res, reply);
     }
 
-    // If request came FROM a terminal screen (Finish button), close the flow.
+    // If the *request* came from a terminal screen (Finish button), close now
     if (TERMINAL_SCREENS.has(clean?.screen)) {
       const closePayload = {
         version: clean?.version || "3.0",
         data: { status: "success" },
         close_flow: true
       };
-      const closeReply =
-        aesKey && ivBuf
-          ? gcmEncryptToB64(aesKey, invert(ivBuf), closePayload)
-          : Buffer.from(JSON.stringify(closePayload)).toString("base64");
+      const closeReply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), closePayload)
+        : Buffer.from(JSON.stringify(closePayload)).toString("base64");
       log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", closeReply.length);
       return sendB64(res, closeReply);
     }
 
-    // Otherwise, compute next screen & navigate; if the next is terminal, also close.
-    const nextScreen = decideNextScreen(clean);
-    const nextIsTerminal = TERMINAL_SCREENS.has(nextScreen);
+    // Otherwise compute next; if next is terminal, end immediately
+    const next = decideNextScreen(clean);
+    const nextIsTerminal = TERMINAL_SCREENS.has(next);
 
-    let payload;
-    if (nextIsTerminal) {
-      // Final hop: omit "screen" and set close_flow true so client finishes
-      payload = {
-        version: clean?.version || "3.0",
-        data: { status: "success" },
-        close_flow: true
-      };
-      log("FLOW: NAVIGATE → terminal close", nextScreen);
-    } else {
-      payload = {
-        version: clean?.version || "3.0",
-        screen: nextScreen,
-        data: {}
-      };
-      log("FLOW: NAVIGATE →", nextScreen);
-    }
+    const payload = nextIsTerminal
+      ? { version: clean?.version || "3.0", data: { status: "success" }, close_flow: true }
+      : { version: clean?.version || "3.0", screen: next, data: {} };
 
-    const reply =
-      aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
-        : Buffer.from(JSON.stringify(payload)).toString("base64");
+    const reply = aesKey && ivBuf
+      ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+      : Buffer.from(JSON.stringify(payload)).toString("base64");
 
-    // Fire-and-forget forward to Power Automate
+    log("FLOW:", nextIsTerminal ? `NAVIGATE → terminal close ${next}` : `NAVIGATE → ${next}`);
+
+    // Optional forward to Power Automate (non-blocking)
     try {
       if (process.env.MAKE_WEBHOOK_URL) {
         fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -281,12 +234,11 @@ export default async function handler(req, res) {
           body: JSON.stringify(clean)
         }).catch(() => {});
       }
-    } catch {/* ignore */}
+    } catch {}
 
     return sendB64(res, reply);
   } catch (e) {
     log("FLOW: handler error", e?.message || e);
-    // Safety fallback keeps client alive
     const fallback = Buffer.from(JSON.stringify({ data: { status: "success" } })).toString("base64");
     return sendB64(res, fallback);
   }

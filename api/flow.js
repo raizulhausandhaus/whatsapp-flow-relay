@@ -226,7 +226,12 @@ export default async function handler(req, res) {
 
     // If the request is FROM a terminal screen (user tapped Finish) → close
     if (TERMINAL_SCREENS.has(clean?.screen)) {
-      const payload = withCommonFields(clean, { data: { status: "success" }, close_flow: true });
+      // Include the current terminal screen id AND close_flow:true
+      const payload = withCommonFields(clean, {
+        screen: clean.screen,
+        data: { status: "success" },
+        close_flow: true
+      });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
@@ -234,7 +239,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Normal navigate (including navigating INTO a terminal screen) → return screen (NO close_flow here)
+    // Normal navigate (into next screen, including terminals) → return screen (NO close_flow yet)
     const next = nextScreen(clean);
     const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf

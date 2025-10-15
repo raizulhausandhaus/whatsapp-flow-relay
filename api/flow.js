@@ -1,43 +1,39 @@
 // api/flow.js
 import crypto from "node:crypto";
 
-/* ----------------------- helpers ----------------------- */
+/* ---------- tiny helpers ---------- */
 const sendJSON = (res, obj) => {
   res.setHeader("Content-Type", "application/json");
   return res.status(200).send(JSON.stringify(obj));
 };
 
-// Return a raw Base64 string: no quotes, no spaces, text/plain
-const sendBase64Plain = (res, base64String) => {
-  const body = (base64String || "").toString().trim(); // ensure no newline/space
+const sendBase64 = (res, base64String) => {
+  const body = (base64String || "").trim(); // no quotes/whitespace
   res.setHeader("Content-Type", "text/plain");
   return res.status(200).send(body);
 };
 
-const toB64 = (x) =>
-  Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
+const VALID_AES_BYTES = new Set([16, 24, 32]); // AES-128/192/256
 
-/* ------------------- crypto (Meta Flows) ------------------ */
-const VALID_AES_BYTES = new Set([16, 24, 32]); // 128/192/256
-
-function tryRsaOaepSha256DecryptKey(encryptedKeyB64, privatePem) {
+/* ---------- key/iv handling per Meta ---------- */
+function rsaDecryptIfWrapped(aesKeyB64, privatePem) {
   try {
-    const enc = Buffer.from(encryptedKeyB64, "base64");
-    return crypto.privateDecrypt({ key: privatePem, oaepHash: "sha256" }, enc);
+    const wrapped = Buffer.from(aesKeyB64, "base64");
+    return crypto.privateDecrypt({ key: privatePem, oaepHash: "sha256" }, wrapped);
   } catch {
     return null;
   }
 }
 
-function deriveAesKey(encryptedKeyB64, privatePem) {
-  // 1) RSA-wrapped?
+function getAesKey(aesKeyB64, privatePem) {
+  // 1) Try RSA-OAEP(SHA-256)
   if (privatePem) {
-    const k = tryRsaOaepSha256DecryptKey(encryptedKeyB64, privatePem);
+    const k = rsaDecryptIfWrapped(aesKeyB64, privatePem);
     if (k && VALID_AES_BYTES.has(k.length)) return k;
   }
-  // 2) Otherwise the value itself is Base64 of the raw AES key
+  // 2) Fall back to raw Base64 key
   try {
-    const k = Buffer.from(encryptedKeyB64, "base64");
+    const k = Buffer.from(aesKeyB64, "base64");
     if (VALID_AES_BYTES.has(k.length)) return k;
   } catch {}
   return null;
@@ -49,28 +45,29 @@ function invertIv(ivBuf) {
   return out;
 }
 
-function aesGcmDecryptToJson(aesKeyBuf, ivB64, cipherB64) {
-  const iv = Buffer.from(ivB64, "base64");          // accept 12/16/etc
-  const data = Buffer.from(cipherB64, "base64");    // cipher || tag
-  const tag = data.subarray(data.length - 16);
-  const ciphertext = data.subarray(0, data.length - 16);
-  const bits = aesKeyBuf.length * 8;                // 128/192/256
-  const decipher = crypto.createDecipheriv(`aes-${bits}-gcm`, aesKeyBuf, iv);
-  decipher.setAuthTag(tag);
-  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return JSON.parse(plain.toString("utf8"));
-}
-
+/* ---------- AES-GCM primitives ---------- */
 function aesGcmEncryptToBase64(aesKeyBuf, ivBuf, obj) {
-  const bits = aesKeyBuf.length * 8;
+  const bits = aesKeyBuf.length * 8; // 128/192/256
   const cipher = crypto.createCipheriv(`aes-${bits}-gcm`, aesKeyBuf, ivBuf);
   const payload = Buffer.from(JSON.stringify(obj), "utf8");
-  const enc = Buffer.concat([cipher.update(payload), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([enc, tag]).toString("base64");
+  const ct = Buffer.concat([cipher.update(payload), cipher.final()]);
+  const tag = cipher.getAuthTag(); // 16 bytes
+  return Buffer.concat([ct, tag]).toString("base64"); // Base64(cipher || tag)
 }
 
-/* --------- extract materials (names vary between tenants) ---------- */
+function aesGcmDecryptJson(aesKeyBuf, ivB64, cipherB64) {
+  const iv = Buffer.from(ivB64, "base64"); // accept 12 or 16
+  const data = Buffer.from(cipherB64, "base64");
+  const tag = data.subarray(data.length - 16);
+  const ct = data.subarray(0, data.length - 16);
+  const bits = aesKeyBuf.length * 8;
+  const decipher = crypto.createDecipheriv(`aes-${bits}-gcm`, aesKeyBuf, iv);
+  decipher.setAuthTag(tag);
+  const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+  return JSON.parse(pt.toString("utf8"));
+}
+
+/* ---------- extract materials (field names vary slightly) ---------- */
 function extractMaterials(body) {
   const encryptedKey =
     body?.encrypted_aes_key ??
@@ -91,72 +88,63 @@ function extractMaterials(body) {
   return { encryptedKey, initialIv, encryptedFlowData };
 }
 
-/* -------------------------- handler -------------------------- */
+/* ------------------- main handler ------------------- */
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // robust parse
+    // Parse body robustly
     let body = req.body && typeof req.body === "object" ? req.body : {};
     if (!Object.keys(body).length) {
       const raw = await new Promise((resolve) => {
-        let data = "";
-        req.on("data", (c) => (data += c));
-        req.on("end", () => resolve(data));
+        let d = "";
+        req.on("data", (c) => (d += c));
+        req.on("end", () => resolve(d));
       });
       try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
     }
 
     if (process.env.LOG_REQUEST === "1") {
-      console.log("REQ headers:", JSON.stringify(req.headers).slice(0, 4000));
-      console.log("REQ body:", JSON.stringify(body).slice(0, 4000));
+      console.log("FLOW PROBE headers:", JSON.stringify(req.headers).slice(0, 4000));
+      console.log("FLOW PROBE body:", JSON.stringify(body).slice(0, 4000));
     }
 
-    // 1) Public key signing challenge
+    // 1) Public-key challenge
     if (body?.challenge) return sendJSON(res, { challenge: body.challenge });
 
-    // 2) Materials (if Meta includes them)
+    // 2) Health check vs data_exchange
     const { encryptedKey, initialIv, encryptedFlowData } = extractMaterials(body);
     const haveMaterials = Boolean(encryptedKey && initialIv);
 
-    // 3) HEALTH CHECK (or any POST without encrypted_flow_data):
-    // Return Base64 body no matter what. If materials exist, encrypt {"ok":true}
-    if (!encryptedFlowData) {
+    // Health check (materials present, but no payload)
+    if (haveMaterials && !encryptedFlowData) {
       try {
-        if (haveMaterials) {
-          const aesKey = deriveAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
-          if (aesKey) {
-            const iv = Buffer.from(initialIv, "base64");
-            const flipped = invertIv(iv);
-            const base64Body = aesGcmEncryptToBase64(aesKey, flipped, { ok: true });
-            console.log(`HealthCheck reply(enc): len=${base64Body.length}, key=${aesKey.length}, iv=${iv.length}`);
-            return sendBase64Plain(res, base64Body);
-          }
-        }
+        const aesKey = getAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
+        if (!aesKey) throw new Error("Unable to derive AES key from materials");
+        const iv = Buffer.from(initialIv, "base64");
+        const reply = aesGcmEncryptToBase64(aesKey, invertIv(iv), { ok: true });
+        console.log(`HealthCheck: key=${aesKey.length}B, iv=${iv.length}B, outB64=${reply.length}`);
+        return sendBase64(res, reply); // raw Base64 body, text/plain
       } catch (e) {
         console.error("Health encrypt error:", e?.message || e);
+        // Last-resort: still return Base64 (prevents the “not Base64” error)
+        return sendBase64(res, Buffer.from("ok").toString("base64")); // "b2s="
       }
-      // Fallback: plain Base64 string (still valid for the checker)
-      const fallback = toB64("ok"); // "b2s="
-      console.log(`HealthCheck reply(fallback): ${fallback}`);
-      return sendBase64Plain(res, fallback);
     }
 
-    // 4) NORMAL TRAFFIC: decrypt then forward
+    // Normal traffic: decrypt if present, then forward
     let clean = body;
-    if (haveMaterials) {
+    if (haveMaterials && encryptedFlowData) {
       try {
-        const aesKey = deriveAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
-        if (aesKey) {
-          clean = aesGcmDecryptToJson(aesKey, initialIv, encryptedFlowData);
-        }
+        const aesKey = getAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
+        if (aesKey) clean = aesGcmDecryptJson(aesKey, initialIv, encryptedFlowData);
       } catch (e) {
         console.error("Decrypt request error:", e?.message || e);
       }
     }
 
-    // 5) Forward to Power Automate
+    // Forward to Power Automate
     if (process.env.MAKE_WEBHOOK_URL) {
       try {
         await fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -169,7 +157,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // 6) Ack
     return res.status(200).end();
   } catch (e) {
     console.error("Handler error:", e?.message || e);

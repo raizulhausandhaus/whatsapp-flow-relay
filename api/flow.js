@@ -1,23 +1,23 @@
 // api/flow.js
 import crypto from "node:crypto";
 
-/* --------------------- config / logging --------------------- */
+/* --------------------- logging --------------------- */
 const LOG_ON = process.env.LOG_REQUEST !== "0";
 const log = (...args) => { if (LOG_ON) console.log(...args); };
 
-/* --------------------- tiny responders ---------------------- */
+/* ---------------- responders ---------------- */
 const sendJSON = (res, obj) => {
   res.setHeader("Content-Type", "application/json");
   return res.status(200).end(JSON.stringify(obj));
 };
 const sendB64 = (res, b64) => {
-  const body = (b64 || "").trim();           // raw Base64 only (no quotes)
+  const body = (b64 || "").trim();
   res.setHeader("Content-Type", "application/octet-stream");
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).end(body);
 };
 
-/* ------------------ read raw body (no parsers) --------------- */
+/* --------------- raw body reader --------------- */
 async function readBody(req) {
   return await new Promise((resolve) => {
     let data = "";
@@ -27,16 +27,16 @@ async function readBody(req) {
   });
 }
 
-/* ------------------ decode helpers / crypto ------------------ */
-const VALID_AES = new Set([16, 24, 32]); // 128/192/256 bytes
-const TAG_LEN   = 16;
+/* --------------- crypto helpers --------------- */
+const VALID_AES = new Set([16, 24, 32]); // bytes
+const TAG_LEN = 16;
 
 const isHex  = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
 const fromB64 = (s) => { try { const b = Buffer.from(s, "base64"); return b.length ? b : null; } catch { return null; } };
 const fromHex = (s) => (isHex(s) ? Buffer.from(s, "hex") : null);
 
 function deriveAesKey(anyKey, privatePem) {
-  // 1) Try RSA-OAEP(SHA-256) wrapped (base64)
+  // RSA-OAEP-SHA256?
   const wrapped = fromB64(anyKey);
   if (wrapped && privatePem) {
     try {
@@ -44,12 +44,12 @@ function deriveAesKey(anyKey, privatePem) {
       if (VALID_AES.has(k.length)) return k;
     } catch {}
   }
-  // 2) raw base64
+  // raw Base64?
   if (wrapped && VALID_AES.has(wrapped.length)) return wrapped;
-  // 3) hex
+  // hex?
   const hx = fromHex(anyKey);
   if (hx && VALID_AES.has(hx.length)) return hx;
-  // 4) raw utf8 (very rare)
+  // raw utf8 (rare)
   if (typeof anyKey === "string") {
     const raw = Buffer.from(anyKey, "utf8");
     if (VALID_AES.has(raw.length)) return raw;
@@ -90,7 +90,7 @@ function gcmDecryptJson(key, iv, cipherPlusTagB64) {
   return JSON.parse(pt.toString("utf8"));
 }
 
-/* -------- materials extractor (cover common name variants) --- */
+/* --------------- materials extractor --------------- */
 function getMaterials(body) {
   const key =
     body?.encrypted_aes_key ??
@@ -122,97 +122,104 @@ export default async function handler(req, res) {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).end();
 
-    // --- Raw body parse (no body-parser) ---
-    let bodyStr = await readBody(req);
+    // Parse
+    const bodyStr = await readBody(req);
     let body = {};
     try { body = JSON.parse(bodyStr); } catch { body = {}; }
 
-    // --- Logging (safe) ---
     log("FLOW: recv", {
-      method: req.method,
-      url: req.url,
+      method: req.method, url: req.url,
       contentType: req.headers["content-type"],
-      contentLength: req.headers["content-length"],
+      contentLength: req.headers["content-length"]
     });
     log("FLOW: body keys", Object.keys(body || {}));
     if (body?.data && typeof body.data === "object") {
       log("FLOW: body.data keys", Object.keys(body.data));
     }
 
-    // 0) Ignore Data API "ping" messages (Connect Meta app step)
-    if (body?.action === "ping") {
-      log("FLOW: handled ping");
+    // Ignore Data API pings not wrapped in crypto
+    if (body?.action === "ping" && !body?.encrypted_aes_key && !body?.encrypted_flow_data) {
+      log("FLOW: plaintext ping -> 200");
       return res.status(200).end();
     }
 
-    // 1) Public-key signing challenge
+    // Public-key signing challenge
     if (typeof body.challenge === "string") {
       log("FLOW: challenge echo");
       return sendJSON(res, { challenge: body.challenge });
     }
 
-    // 2) Materials
+    // Materials
     const { key, iv, flow } = getMaterials(body);
     const aesKey = key ? deriveAesKey(key, process.env.FLOW_PRIVATE_PEM) : null;
     const ivBuf  = iv  ? decodeIv(iv) : null;
 
     log("FLOW: materials", {
-      hasEncryptedFlowData: !!flow,
-      hasEncryptedKey: !!key,
-      hasIV: !!iv,
+      hasEncryptedFlowData: !!flow, hasEncryptedKey: !!key, hasIV: !!iv,
       aesKeyLen: aesKey ? aesKey.length : null,
-      ivLen: ivBuf ? ivBuf.length : null,
+      ivLen: ivBuf ? ivBuf.length : null
     });
 
-    // 3) Health check (no encrypted_flow_data): encrypted Base64 response
+    // If no encrypted_flow_data, treat as Health Check: always return encrypted {"ok":true}
     if (!flow) {
       if (aesKey && ivBuf) {
         const reply = gcmEncryptToB64(aesKey, invert(ivBuf), { ok: true });
-        log("FLOW: HC ENCRYPTED reply length (base64 chars)", reply.length);
-        const r = sendB64(res, reply);
-        log("FLOW: HC encrypted completed in ms", Date.now() - t0);
-        return r;
+        log("FLOW: HC ENCRYPTED reply len", reply.length);
+        log("FLOW: HC done in ms", Date.now() - t0);
+        return sendB64(res, reply);
       }
-      // Tenant didn’t send materials — still return Base64
-      const fallback = Buffer.from("ok").toString("base64"); // b2s=
-      log("FLOW: HC FALLBACK base64", fallback);
-      const r = sendB64(res, fallback);
-      log("FLOW: HC fallback completed in ms", Date.now() - t0);
-      return r;
+      const fallback = Buffer.from("ok").toString("base64");
+      log("FLOW: HC FALLBACK", fallback);
+      log("FLOW: HC done in ms", Date.now() - t0);
+      return sendB64(res, fallback);
     }
 
-    // 4) Live data: decrypt, forward (optional), ack
-    let clean = body;
+    // encrypted_flow_data present → decrypt first
+    let clean = {};
     try {
       if (aesKey && ivBuf) {
         clean = gcmDecryptJson(aesKey, ivBuf, flow);
-        log("FLOW: data_exchange decrypted keys", Object.keys(clean || {}));
+        log("FLOW: decrypted keys", Object.keys(clean || {}));
       } else {
-        log("FLOW: data_exchange without materials (left body as-is)");
+        log("FLOW: cannot decrypt (missing materials)");
+        clean = body;
       }
     } catch (e) {
-      log("FLOW: Decrypt error", e?.message || e);
+      log("FLOW: decrypt error", e?.message || e);
+      clean = {};
     }
 
+    // 🔑 NEW: if decrypted payload is a probe (ping/health_check), return ENCRYPTED Base64
+    if (clean && (clean.action === "ping" || clean.action === "health_check")) {
+      if (aesKey && ivBuf) {
+        const reply = gcmEncryptToB64(aesKey, invert(ivBuf), { ok: true });
+        log("FLOW: PROBE reply (encrypted) len", reply.length, "action", clean.action);
+        return sendB64(res, reply);
+      }
+      const fallback = Buffer.from("ok").toString("base64");
+      log("FLOW: PROBE fallback (no materials)", fallback);
+      return sendB64(res, fallback);
+    }
+
+    // Otherwise it's real data_exchange → forward (optional) and ACK
     try {
       if (process.env.MAKE_WEBHOOK_URL) {
         const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(clean),
+          body: JSON.stringify(clean)
         });
         log("FLOW: forwarded to Power Automate status", resp.status);
       }
     } catch (e) {
-      log("FLOW: Forward failed", e?.message || e);
+      log("FLOW: forward failed", e?.message || e);
     }
 
-    log("FLOW: data_exchange completed in ms", Date.now() - t0);
+    log("FLOW: data_exchange done in ms", Date.now() - t0);
     return res.status(200).end();
   } catch (e) {
-    log("FLOW: Handler error", e?.message || e);
-    // Even on error, return Base64 to avoid “not Base64” complaint
-    const fallback = Buffer.from("ok").toString("base64");
-    return sendB64(res, fallback);
+    log("FLOW: handler error", e?.message || e);
+    // keep HC happy on unexpected errors
+    return sendB64(res, Buffer.from("ok").toString("base64"));
   }
 }

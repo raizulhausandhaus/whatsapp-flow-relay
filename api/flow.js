@@ -1,134 +1,134 @@
-import { createPrivateKey } from "node:crypto";
-import { compactDecrypt, CompactEncrypt, importSPKI } from "jose";
+import crypto from "node:crypto";
 
-const toJSON = (res, obj) => { res.setHeader("Content-Type","application/json"); return res.status(200).send(JSON.stringify(obj)); };
-const toText = (res, txt) => { res.setHeader("Content-Type","text/plain"); return res.status(200).send(txt); };
-const b64 = (x) => Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
+// helpers
+const sendJSON = (res, obj) => { res.setHeader("Content-Type","application/json"); return res.status(200).send(JSON.stringify(obj)); };
+const sendText = (res, txt) => { res.setHeader("Content-Type","text/plain"); return res.status(200).send(txt); };
 
-async function findMetaPubKey(req, body) {
-  const H = req.headers || {};
+// --- Core WhatsApp Flows crypto (per Meta guide) ---
 
-  // Try common header names
-  const headerNames = [
-    "x-meta-public-key",
-    "x-waba-public-key",
-    "x-whatsapp-public-key",
-    "x-meta-healthcheck-key",
-    "x-wa-public-key",
-  ];
-  for (const name of headerNames) {
-    const val = H[name];
-    if (typeof val === "string" && val.includes("BEGIN PUBLIC KEY")) {
-      try { return await importSPKI(val, "RSA-OAEP-256"); } catch {}
-    }
-  }
-
-  // Try Base64-encoded PEM in headers
-  const headerB64 = ["x-meta-public-key-b64","x-waba-public-key-b64","x-wa-public-key-b64"];
-  for (const name of headerB64) {
-    const v = H[name];
-    if (typeof v === "string") {
-      try {
-        const pem = Buffer.from(v, "base64").toString("utf8");
-        if (pem.includes("BEGIN PUBLIC KEY")) return await importSPKI(pem, "RSA-OAEP-256");
-      } catch {}
-    }
-  }
-
-  // Try body fields
-  const bodyCandidates = [
-    body?.meta_public_key_pem,
-    body?.public_key_pem,
-    body?.health_check?.public_key_pem,
-  ];
-  for (const v of bodyCandidates) {
-    if (typeof v === "string" && v.includes("BEGIN PUBLIC KEY")) {
-      try { return await importSPKI(v, "RSA-OAEP-256"); } catch {}
-    }
-  }
-
-  return null;
+// 1) RSA-OAEP(SHA-256) decrypt -> get AES session key (32 bytes)
+function rsaDecryptAesKey(encryptedKeyB64, privatePem) {
+  const enc = Buffer.from(encryptedKeyB64, "base64");
+  const key = crypto.privateDecrypt(
+    { key: privatePem, oaepHash: "sha256" },
+    enc
+  );
+  return key; // Buffer of 16 or 32 bytes (we expect 32 for AES-256)
 }
 
-async function encryptHealthAck(pubKey) {
-  const payload = Buffer.from(JSON.stringify({ ok: true }));
-  const jwe = await new CompactEncrypt(payload)
-    .setProtectedHeader({ alg: "RSA-OAEP-256", enc: "A256GCM" })
-    .encrypt(pubKey);
-  return b64(jwe); // Health check expects Base64(JWE)
+// 2) Invert IV bytes for the RESPONSE encryption (Meta requirement)
+function invertIv(ivBuffer) {
+  const out = Buffer.alloc(ivBuffer.length);
+  for (let i = 0; i < ivBuffer.length; i++) out[i] = ivBuffer[i] ^ 0xff;
+  return out;
+}
+
+// 3) AES-256-GCM decrypt (request) and encrypt (response)
+function aesGcmDecrypt(keyBuf, ivB64, cipherB64) {
+  const iv = Buffer.from(ivB64, "base64");
+  const data = Buffer.from(cipherB64, "base64");
+  // last 16 bytes = auth tag
+  const tag = data.subarray(data.length - 16);
+  const ciphertext = data.subarray(0, data.length - 16);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuf, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return JSON.parse(plain.toString("utf8"));
+}
+
+function aesGcmEncrypt(keyBuf, ivBuf, obj) {
+  const cipher = crypto.createCipheriv("aes-256-gcm", keyBuf, ivBuf);
+  const payload = Buffer.from(JSON.stringify(obj), "utf8");
+  const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+  const tag = cipher.getAuthTag(); // 16 bytes
+  return Buffer.concat([encrypted, tag]).toString("base64"); // Base64(cipher||tag)
+}
+
+// Try to read Meta health-check materials from body (names vary a bit by tenant)
+function readMaterials(body) {
+  // common field names seen in the wild
+  const encryptedKey =
+    body?.encrypted_aes_key ||
+    body?.encrypted_session_key ||
+    body?.encrypted_key ||
+    body?.data?.encrypted_aes_key ||
+    body?.data?.encrypted_session_key;
+
+  const initialIv =
+    body?.initial_vector ||
+    body?.initial_iv ||
+    body?.data?.initial_vector;
+
+  const encryptedFlowData =
+    body?.encrypted_flow_data ||
+    body?.data?.encrypted_flow_data;
+
+  return { encryptedKey, initialIv, encryptedFlowData };
 }
 
 export default async function handler(req, res) {
   try {
-    if (req.method === "GET") return toJSON(res, { status: "ok" });
+    if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Robust parse
-    let body = req.body && typeof req.body === "object" ? req.body : {};
+    // Parse body robustly
+    let body = (req.body && typeof req.body === "object") ? req.body : {};
     if (!Object.keys(body).length) {
-      const raw = await new Promise((r)=>{ let d=""; req.on("data",(c)=>d+=c); req.on("end",()=>r(d)); });
+      const raw = await new Promise((r) => { let d=""; req.on("data",(c)=>d+=c); req.on("end",()=>r(d)); });
       try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
     }
 
-    // Challenge echo
-    if (body?.challenge) return toJSON(res, { challenge: body.challenge });
+    // A) Meta signing challenge
+    if (body?.challenge) return sendJSON(res, { challenge: body.challenge });
 
-    // Heuristic: health probe
-    const isHealth =
-      req.headers["x-meta-health-check"] === "1" ||
-      body?.type === "health_check" ||
-      body?.health_check === true ||
-      (!body.encrypted_flow_data && !body.encrypted_flow_data_v2 && !body?.data?.encrypted_flow_data && Object.keys(body).length <= 2);
+    // B) Inspect encryption materials
+    const { encryptedKey, initialIv, encryptedFlowData } = readMaterials(body);
+    const hasMaterials = !!(encryptedKey && initialIv);
 
-    if (isHealth) {
-      // Optional debug: log headers/body to find the key field
-      if (process.env.LOG_HEALTH_DEBUG === "1") {
-        console.log("META HEALTH DEBUG: headers=", JSON.stringify(req.headers || {}, null, 2).slice(0, 6000));
-        console.log("META HEALTH DEBUG: body=", JSON.stringify(body || {}, null, 2).slice(0, 4000));
-      }
-
+    // C) HEALTH CHECK path:
+    // Health probe usually sends only encryptedKey + initialIv (no flow data).
+    // Requirement: respond with Base64(AES-GCM(encrypt({"ok":true}) with inverted IV))
+    if (hasMaterials && !encryptedFlowData) {
       try {
-        const pub = await findMetaPubKey(req, body);
-        if (pub) {
-          const resp = await encryptHealthAck(pub);
-          return toText(res, resp);
-        }
+        const aesKey = rsaDecryptAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
+        const iv = Buffer.from(initialIv, "base64");
+        const flippedIv = invertIv(iv);
+
+        const b64 = aesGcmEncrypt(aesKey, flippedIv, { ok: true });
+        return sendText(res, b64); // raw Base64 string body (no JSON)
       } catch (e) {
         console.error("Health encrypt error:", e?.message || e);
+        // Fallback: still return Base64 of "ok" to avoid "not Base64" error
+        return sendText(res, Buffer.from("ok").toString("base64"));
       }
-      // Fallback for older tenants (will fail “decrypt response” but helps us iterate)
-      return toText(res, b64("ok"));
     }
 
-    // Normal traffic: decrypt if JWE present (ignore errors)
-    const jwe =
-      body.encrypted_flow_data ||
-      body.encrypted_flow_data_v2 ||
-      body?.data?.encrypted_flow_data ||
-      null;
-
-    if (jwe && process.env.FLOW_PRIVATE_PEM) {
+    // D) NORMAL TRAFFIC: decrypt user payload (if present), then forward to Power Automate
+    let clean = body;
+    if (hasMaterials && encryptedFlowData) {
       try {
-        const { plaintext } = await compactDecrypt(jwe, createPrivateKey(process.env.FLOW_PRIVATE_PEM));
-        body = JSON.parse(new TextDecoder().decode(plaintext));
+        const aesKey = rsaDecryptAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
+        clean = aesGcmDecrypt(aesKey, initialIv, encryptedFlowData);
       } catch (e) {
-        console.error("Decryption error:", e?.message || e);
+        console.error("Decrypt request error:", e?.message || e);
       }
     }
 
-    // Forward to Power Automate
+    // Forward clean data to your automation
     if (process.env.MAKE_WEBHOOK_URL) {
       try {
         await fetch(process.env.MAKE_WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
+          body: JSON.stringify(clean)
         });
       } catch (e) {
         console.error("Forward failed:", e?.message || e);
       }
     }
 
+    // E) ACK to Meta (for data_exchange you can return an encrypted navigate; plain 200 is fine for now)
     return res.status(200).end();
   } catch (e) {
     console.error("Handler error:", e?.message || e);

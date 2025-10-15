@@ -107,24 +107,22 @@ function getMaterials(b) {
 
 /* --------------- flow logic --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
+const START_SCREEN_ID = "ask_nps"; // <- your start screen
 
 function decideNextScreen(clean) {
   const scr = clean?.screen;
   const d = clean?.data || {};
 
-  // Start is ask_nps
   if (scr === "ask_nps") {
     const s = Number(d.score ?? d.nps_score ?? "-1");
     if (!Number.isNaN(s) && s >= 8) return "end_positive";
     return "discuss_invite";
   }
-
   if (scr === "discuss_invite") {
     if (d.discuss === "discuss_yes") return "end_discuss_yes";
     if (d.discuss === "discuss_no")  return "end_no";
   }
-
-  return scr || "ask_nps";
+  return scr || START_SCREEN_ID;
 }
 
 /* ------------------- handler ------------------- */
@@ -166,7 +164,7 @@ export default async function handler(req, res) {
       aesKeyLen: aesKey?.length || null, ivLen: ivBuf?.length || null
     });
 
-    // Health check (no encrypted_flow_data)
+    // Health check (no encrypted_flow_data) -> encrypted {"data":{"status":"active"}}
     const HC_OK = { data: { status: "active" } };
     if (!flow) {
       const reply = aesKey && ivBuf
@@ -189,11 +187,26 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // Encrypted probe
-    if (clean && (clean.action === "ping" || clean.action === "health_check")) {
+    // --- RUNTIME START PING: no screen provided → navigate to first screen
+    if (clean && clean.action === "ping" && !clean.screen) {
+      const payload = {
+        version: clean?.version || "3.0",
+        screen: START_SCREEN_ID,
+        data: {}
+      };
+      const reply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+        : Buffer.from(JSON.stringify(payload)).toString("base64");
+      log("FLOW: START → navigate to", START_SCREEN_ID);
+      return sendB64(res, reply);
+    }
+
+    // Encrypted health_check (explicit)
+    if (clean && clean.action === "health_check") {
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK)
         : Buffer.from(JSON.stringify(HC_OK)).toString("base64");
+      log("FLOW: PROBE reply (HC) len", reply.length);
       return sendB64(res, reply);
     }
 

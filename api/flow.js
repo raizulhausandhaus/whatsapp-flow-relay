@@ -107,7 +107,7 @@ function getMaterials(b) {
 
 /* --------------- flow logic --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
-const START_SCREEN_ID = "ask_nps"; // your start screen
+const START_SCREEN_ID = "ask_nps";
 
 function nextScreen(clean) {
   const scr = clean?.screen;
@@ -125,16 +125,9 @@ function nextScreen(clean) {
 }
 
 /* --------------- payload builders (echo flow_token & version) --------------- */
-function echoVersion(v) {
-  // Keep the exact type the client sent (number or string)
-  return typeof v === "number" ? v : (typeof v === "string" ? v : "3.0");
-}
+function echoVersion(v) { return typeof v === "number" ? v : (typeof v === "string" ? v : "3.0"); }
 function withCommonFields(clean, obj) {
-  // Echo flow_token if present
-  if (clean && typeof clean.flow_token !== "undefined") {
-    obj.flow_token = clean.flow_token;
-  }
-  // Echo version with same type
+  if (typeof clean?.flow_token !== "undefined") obj.flow_token = clean.flow_token;
   obj.version = echoVersion(clean?.version);
   return obj;
 }
@@ -178,7 +171,7 @@ export default async function handler(req, res) {
       aesKeyLen: aesKey?.length || null, ivLen: ivBuf?.length || null
     });
 
-    // Health check (no encrypted_flow_data) -> encrypted {"data":{"status":"active"}}
+    // Health check (no encrypted_flow_data)
     const HC_OK = { data: { status: "active" } };
     if (!flow) {
       const reply = aesKey && ivBuf
@@ -201,7 +194,7 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // ---------- RUNTIME START PING (no screen) -> navigate to first screen ----------
+    // Start ping (no screen) → first screen
     if (clean && clean.action === "ping" && !clean.screen) {
       const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
@@ -211,7 +204,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // ---------- Encrypted health_check probe ----------
+    // Encrypted health_check probe
     if (clean && clean.action === "health_check") {
       const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
@@ -221,7 +214,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // ---------- RECOVER: client "navigate" error callback ----------
+    // Client navigate error callback → recover to start screen
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
       const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
@@ -231,7 +224,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // ---------- Terminal request (user tapped Finish) -> close flow ----------
+    // If the request is FROM a terminal screen (user tapped Finish) → close
     if (TERMINAL_SCREENS.has(clean?.screen)) {
       const payload = withCommonFields(clean, { data: { status: "success" }, close_flow: true });
       const reply = aesKey && ivBuf
@@ -241,19 +234,14 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // ---------- Normal navigate ----------
+    // Normal navigate (including navigating INTO a terminal screen) → return screen (NO close_flow here)
     const next = nextScreen(clean);
-    const nextIsTerminal = TERMINAL_SCREENS.has(next);
-
-    const payload = nextIsTerminal
-      ? withCommonFields(clean, { data: { status: "success" }, close_flow: true })
-      : withCommonFields(clean, { screen: next, data: {} });
-
+    const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf
       ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
       : Buffer.from(JSON.stringify(payload)).toString("base64");
 
-    log("FLOW:", nextIsTerminal ? `NAVIGATE → terminal close ${next}` : `NAVIGATE → ${next}`);
+    log("FLOW: NAVIGATE →", next);
 
     // Optional forward to Power Automate (non-blocking)
     try {

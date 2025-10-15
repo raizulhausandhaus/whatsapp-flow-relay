@@ -109,10 +109,9 @@ function getMaterials(b) {
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
 const START_SCREEN_ID = "ask_nps"; // your start screen
 
-function decideNextScreen(clean) {
+function nextScreen(clean) {
   const scr = clean?.screen;
   const d = clean?.data || {};
-
   if (scr === "ask_nps") {
     const s = Number(d.score ?? d.nps_score ?? "-1");
     if (!Number.isNaN(s) && s >= 8) return "end_positive";
@@ -123,6 +122,21 @@ function decideNextScreen(clean) {
     if (d.discuss === "discuss_no")  return "end_no";
   }
   return scr || START_SCREEN_ID;
+}
+
+/* --------------- payload builders (echo flow_token & version) --------------- */
+function echoVersion(v) {
+  // Keep the exact type the client sent (number or string)
+  return typeof v === "number" ? v : (typeof v === "string" ? v : "3.0");
+}
+function withCommonFields(clean, obj) {
+  // Echo flow_token if present
+  if (clean && typeof clean.flow_token !== "undefined") {
+    obj.flow_token = clean.flow_token;
+  }
+  // Echo version with same type
+  obj.version = echoVersion(clean?.version);
+  return obj;
 }
 
 /* ------------------- handler ------------------- */
@@ -189,7 +203,7 @@ export default async function handler(req, res) {
 
     // ---------- RUNTIME START PING (no screen) -> navigate to first screen ----------
     if (clean && clean.action === "ping" && !clean.screen) {
-      const payload = { version: clean?.version || "3.0", screen: START_SCREEN_ID, data: {} };
+      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
@@ -199,16 +213,17 @@ export default async function handler(req, res) {
 
     // ---------- Encrypted health_check probe ----------
     if (clean && clean.action === "health_check") {
+      const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), HC_OK)
-        : Buffer.from(JSON.stringify(HC_OK)).toString("base64");
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+        : Buffer.from(JSON.stringify(payload)).toString("base64");
       log("FLOW: PROBE reply (HC) len", reply.length);
       return sendB64(res, reply);
     }
 
-    // ---------- RECOVER: client "navigate" error callback (e.g., stale screen ids) ----------
+    // ---------- RECOVER: client "navigate" error callback ----------
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
-      const payload = { version: clean?.version || "3.0", screen: START_SCREEN_ID, data: {} };
+      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
@@ -218,21 +233,21 @@ export default async function handler(req, res) {
 
     // ---------- Terminal request (user tapped Finish) -> close flow ----------
     if (TERMINAL_SCREENS.has(clean?.screen)) {
-      const closePayload = { version: clean?.version || "3.0", data: { status: "success" }, close_flow: true };
-      const closeReply = aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), closePayload)
-        : Buffer.from(JSON.stringify(closePayload)).toString("base64");
-      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", closeReply.length);
-      return sendB64(res, closeReply);
+      const payload = withCommonFields(clean, { data: { status: "success" }, close_flow: true });
+      const reply = aesKey && ivBuf
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+        : Buffer.from(JSON.stringify(payload)).toString("base64");
+      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", reply.length);
+      return sendB64(res, reply);
     }
 
     // ---------- Normal navigate ----------
-    const next = decideNextScreen(clean);
+    const next = nextScreen(clean);
     const nextIsTerminal = TERMINAL_SCREENS.has(next);
 
     const payload = nextIsTerminal
-      ? { version: clean?.version || "3.0", data: { status: "success" }, close_flow: true }
-      : { version: clean?.version || "3.0", screen: next, data: {} };
+      ? withCommonFields(clean, { data: { status: "success" }, close_flow: true })
+      : withCommonFields(clean, { screen: next, data: {} });
 
     const reply = aesKey && ivBuf
       ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)

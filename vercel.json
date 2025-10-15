@@ -1,10 +1,5 @@
 {
-  "version": 2.0,
-  "functions": {
-    "api/flow.js": {
-      "runtime": "nodejs18.x"
-    }
-  },
+  "version": 2,
   "routes": [
     { "src": "/api/flow", "dest": "/api/flow.js" }
   ]

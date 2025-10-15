@@ -117,21 +117,10 @@ export default async function handler(req, res) {
     const { encryptedKey, initialIv, encryptedFlowData } = extractMaterials(body);
     const haveMaterials = Boolean(encryptedKey && initialIv);
 
-    // Health check (materials present, but no payload)
-    if (haveMaterials && !encryptedFlowData) {
-      try {
-        const aesKey = getAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
-        if (!aesKey) throw new Error("Unable to derive AES key from materials");
-        const iv = Buffer.from(initialIv, "base64");
-        const reply = aesGcmEncryptToBase64(aesKey, invertIv(iv), { ok: true });
-        console.log(`HealthCheck: key=${aesKey.length}B, iv=${iv.length}B, outB64=${reply.length}`);
-        return sendBase64(res, reply); // raw Base64 body, text/plain
-      } catch (e) {
-        console.error("Health encrypt error:", e?.message || e);
-        // Last-resort: still return Base64 (prevents the “not Base64” error)
-        return sendBase64(res, Buffer.from("ok").toString("base64")); // "b2s="
-      }
-    }
+    // if (process.env.FORCE_B64 === "1" || (!encryptedFlowData && !haveMaterials)) {
+  return sendBase64(res, Buffer.from("ok").toString("base64"));
+}
+
 
     // Normal traffic: decrypt if present, then forward
     let clean = body;

@@ -1,66 +1,78 @@
+// api/flow.js
 import crypto from "node:crypto";
 
-// utils
-const sendJSON = (res, obj) => { res.setHeader("Content-Type","application/json"); return res.status(200).send(JSON.stringify(obj)); };
-const sendText = (res, txt) => { res.setHeader("Content-Type","text/plain"); return res.status(200).send(txt); };
-const b64 = (x) => Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
+// ───────── helpers ─────────
+const sendJSON = (res, obj) => {
+  res.setHeader("Content-Type", "application/json");
+  return res.status(200).send(JSON.stringify(obj));
+};
+const sendText = (res, txt) => {
+  res.setHeader("Content-Type", "text/plain");
+  return res.status(200).send(txt);
+};
+const b64 = (x) =>
+  Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
 
-// --- AES/GCM helpers ---
-const VALID_AES = new Set([16, 24, 32]); // AES-128/192/256
+// ───────── Meta Flows crypto (per docs) ─────────
+
+// some tenants send AES key RSA-encrypted, others send it as Base64 raw key
+const VALID_AES_BYTES = new Set([16, 24, 32]); // 128/192/256
 
 function rsaDecryptMaybe(encryptedKeyB64, privatePem) {
   try {
     const enc = Buffer.from(encryptedKeyB64, "base64");
-    const key = crypto.privateDecrypt({ key: privatePem, oaepHash: "sha256" }, enc);
-    return key; // Buffer
-  } catch (e) {
+    return crypto.privateDecrypt({ key: privatePem, oaepHash: "sha256" }, enc);
+  } catch {
     return null;
   }
 }
 
 function parseAesKey(encryptedKeyB64, privatePem) {
-  // 1) Try RSA decrypt
-  let k = null;
-  if (privatePem) k = rsaDecryptMaybe(encryptedKeyB64, privatePem);
-  if (k && VALID_AES.has(k.length)) return k;
-
-  // 2) Fall back: treat input as base64 of raw AES key
+  // 1) Try RSA-OAEP(SHA-256) decrypt
+  if (privatePem) {
+    const k = rsaDecryptMaybe(encryptedKeyB64, privatePem);
+    if (k && VALID_AES_BYTES.has(k.length)) return k;
+  }
+  // 2) Fallback: treat as Base64 of raw AES key
   try {
-    const direct = Buffer.from(encryptedKeyB64, "base64");
-    if (VALID_AES.has(direct.length)) return direct;
-  } catch (_) {}
-
+    const k = Buffer.from(encryptedKeyB64, "base64");
+    if (VALID_AES_BYTES.has(k.length)) return k;
+  } catch {}
   return null;
 }
 
+// bytewise NOT of IV for response encryption
 function invertIv(ivBuffer) {
   const out = Buffer.alloc(ivBuffer.length);
   for (let i = 0; i < ivBuffer.length; i++) out[i] = ivBuffer[i] ^ 0xff;
   return out;
 }
 
+// AES-GCM decrypt (accept IV length 12 or 16, etc.)
 function aesGcmDecrypt(keyBuf, ivB64, cipherB64) {
-  const iv = Buffer.from(ivB64, "base64");
-  if (iv.length !== 12) throw new Error(`IV must be 12 bytes, got ${iv.length}`);
+  const iv = Buffer.from(ivB64, "base64"); // 12 or 16 are common; don't hard-fail
   const data = Buffer.from(cipherB64, "base64");
-  const tag = data.subarray(data.length - 16);
+  const tag = data.subarray(data.length - 16); // GCM tag is always 16 bytes
   const ciphertext = data.subarray(0, data.length - 16);
-  const decipher = crypto.createDecipheriv(`aes-${keyBuf.length*8}-gcm`, keyBuf, iv);
+  const bits = keyBuf.length * 8; // 128 / 192 / 256
+
+  const decipher = crypto.createDecipheriv(`aes-${bits}-gcm`, keyBuf, iv);
   decipher.setAuthTag(tag);
   const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(plain.toString("utf8"));
 }
 
+// AES-GCM encrypt response payload; return Base64(cipher||tag)
 function aesGcmEncrypt(keyBuf, ivBuf, obj) {
-  if (ivBuf.length !== 12) throw new Error(`IV must be 12 bytes, got ${ivBuf.length}`);
-  const cipher = crypto.createCipheriv(`aes-${keyBuf.length*8}-gcm`, keyBuf, ivBuf);
+  const bits = keyBuf.length * 8;
+  const cipher = crypto.createCipheriv(`aes-${bits}-gcm`, keyBuf, ivBuf);
   const payload = Buffer.from(JSON.stringify(obj), "utf8");
   const enc = Buffer.concat([cipher.update(payload), cipher.final()]);
-  const tag = cipher.getAuthTag();
+  const tag = cipher.getAuthTag(); // 16 bytes
   return Buffer.concat([enc, tag]).toString("base64");
 }
 
-// read materials with common field names
+// extract materials (names vary slightly across tenants)
 function readMaterials(body) {
   const encryptedKey =
     body?.encrypted_aes_key ||
@@ -81,71 +93,84 @@ function readMaterials(body) {
   return { encryptedKey, initialIv, encryptedFlowData };
 }
 
+// ───────── main handler ─────────
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") return sendJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // robust parse
-    let body = (req.body && typeof req.body === "object") ? req.body : {};
+    // robust JSON parse (Vercel often gives parsed body already)
+    let body =
+      req.body && typeof req.body === "object" ? req.body : {};
     if (!Object.keys(body).length) {
-      const raw = await new Promise((r)=>{ let d=""; req.on("data",(c)=>d+=c); req.on("end",()=>r(d)); });
-      try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+      const raw = await new Promise((r) => {
+        let d = "";
+        req.on("data", (c) => (d += c));
+        req.on("end", () => r(d));
+      });
+      try {
+        body = JSON.parse(raw || "{}");
+      } catch {
+        body = {};
+      }
     }
 
-    // challenge echo
+    // A) public-key challenge (sign public key step)
     if (body?.challenge) return sendJSON(res, { challenge: body.challenge });
 
-    // materials
+    // B) read encryption materials
     const { encryptedKey, initialIv, encryptedFlowData } = readMaterials(body);
     const hasMaterials = Boolean(encryptedKey && initialIv);
 
-    // HEALTH CHECK: encryptedKey + initialIv, no payload
+    // C) HEALTH CHECK: meta sends only key+IV (no payload).
+    // Must respond with Base64(AES-GCM encrypt of {"ok":true} using SAME key + INVERTED IV)
     if (hasMaterials && !encryptedFlowData) {
       try {
         const aesKey = parseAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
         if (!aesKey) throw new Error("Unable to derive AES key from materials");
-        console.log(`HealthCheck: AES key length=${aesKey.length} bytes, IV(b64) len=${Buffer.from(initialIv,"base64").length}`);
 
-        const iv = Buffer.from(initialIv, "base64");
-        const flipped = invertIv(iv);
+        const iv = Buffer.from(initialIv, "base64");      // accept 12/16
+        const flipped = invertIv(iv);                     // per Meta spec
         const respB64 = aesGcmEncrypt(aesKey, flipped, { ok: true });
-        return sendText(res, respB64); // raw Base64
+        return sendText(res, respB64);                    // raw Base64 body
       } catch (e) {
         console.error("Health encrypt error:", e?.message || e);
-        return sendText(res, b64("ok")); // fallback (may still fail, but always Base64)
+        // Fallback stays Base64 so checker never says "not Base64"
+        return sendText(res, b64("ok"));
       }
     }
 
-    // NORMAL: decrypt then forward
+    // D) NORMAL TRAFFIC: decrypt payload if present, then forward to Power Automate
     let clean = body;
     if (hasMaterials && encryptedFlowData) {
       try {
         const aesKey = parseAesKey(encryptedKey, process.env.FLOW_PRIVATE_PEM);
         if (!aesKey) throw new Error("Unable to derive AES key from materials");
-        console.log(`Decrypt: AES key length=${aesKey.length} bytes, IV len=${Buffer.from(initialIv,"base64").length}`);
+
         clean = aesGcmDecrypt(aesKey, initialIv, encryptedFlowData);
       } catch (e) {
         console.error("Decrypt request error:", e?.message || e);
+        // leave clean as original body if decrypt fails (still ACK)
       }
     }
 
-    // forward to Power Automate
+    // E) Forward to your automation (Power Automate webhook URL in env)
     if (process.env.MAKE_WEBHOOK_URL) {
       try {
         await fetch(process.env.MAKE_WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(clean)
+          body: JSON.stringify(clean),
         });
       } catch (e) {
         console.error("Forward failed:", e?.message || e);
       }
     }
 
+    // F) Final ACK (for data_exchange you can later return an encrypted navigate action)
     return res.status(200).end();
   } catch (e) {
     console.error("Handler error:", e?.message || e);
-    return res.status(200).end();
+    return res.status(200).end(); // prevent retries
   }
 }

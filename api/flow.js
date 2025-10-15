@@ -28,7 +28,7 @@ async function readBody(req) {
 }
 
 /* --------------- crypto helpers --------------- */
-const VALID_AES = new Set([16, 24, 32]); // bytes
+const VALID_AES = new Set([16, 24, 32]); // bytes (128/192/256)
 const TAG_LEN = 16;
 
 const isHex  = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
@@ -36,6 +36,7 @@ const fromB64 = (s) => { try { const b = Buffer.from(s, "base64"); return b.leng
 const fromHex = (s) => (isHex(s) ? Buffer.from(s, "hex") : null);
 
 function deriveAesKey(anyKey, privatePem) {
+  // 1) RSA-OAEP-SHA256 wrapped
   const wrapped = fromB64(anyKey);
   if (wrapped && privatePem) {
     try {
@@ -43,9 +44,12 @@ function deriveAesKey(anyKey, privatePem) {
       if (VALID_AES.has(k.length)) return k;
     } catch {}
   }
+  // 2) raw base64
   if (wrapped && VALID_AES.has(wrapped.length)) return wrapped;
+  // 3) hex
   const hx = fromHex(anyKey);
   if (hx && VALID_AES.has(hx.length)) return hx;
+  // 4) utf8 (fallback)
   if (typeof anyKey === "string") {
     const raw = Buffer.from(anyKey, "utf8");
     if (VALID_AES.has(raw.length)) return raw;
@@ -114,29 +118,33 @@ function getMaterials(body) {
   return { key, iv, flow };
 }
 
-/* --------------- navigation helper --------------- */
+/* --------------- navigation helpers --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
 
 function decideNextScreen(clean) {
   const screen = clean?.screen;
   const data = clean?.data || {};
 
+  // ask_experience: Yes -> ask_nps, No -> end_no
   if (screen === "ask_experience") {
     if (data.consent === "yes_experience") return "ask_nps";
     if (data.consent === "no_experience")  return "end_no";
   }
 
+  // ask_nps: score >= 8 -> end_positive ; else -> discuss_invite
   if (screen === "ask_nps") {
     const s = Number(data.score ?? data.nps_score ?? "-1");
     if (!Number.isNaN(s) && s >= 8) return "end_positive";
     return "discuss_invite";
   }
 
+  // discuss_invite: Yes -> end_discuss_yes ; No -> end_no
   if (screen === "discuss_invite") {
     if (data.discuss === "discuss_yes") return "end_discuss_yes";
     if (data.discuss === "discuss_no")  return "end_no";
   }
 
+  // Fallback
   return screen || "ask_experience";
 }
 
@@ -161,16 +169,19 @@ export default async function handler(req, res) {
       log("FLOW: body.data keys", Object.keys(body.data));
     }
 
+    // Ignore plaintext Data API ping during "Connect Meta app"
     if (body?.action === "ping" && !body?.encrypted_aes_key && !body?.encrypted_flow_data) {
       log("FLOW: plaintext ping -> 200");
       return res.status(200).end();
     }
 
+    // Public-key signing challenge
     if (typeof body.challenge === "string") {
       log("FLOW: challenge echo");
       return sendJSON(res, { challenge: body.challenge });
     }
 
+    // Materials
     const { key, iv, flow } = getMaterials(body);
     const aesKey = key ? deriveAesKey(key, process.env.FLOW_PRIVATE_PEM) : null;
     const ivBuf  = iv  ? decodeIv(iv) : null;
@@ -181,6 +192,7 @@ export default async function handler(req, res) {
       ivLen: ivBuf ? ivBuf.length : null
     });
 
+    // Health check (no encrypted_flow_data) -> encrypted {"data":{"status":"active"}}
     const HC_OK_OBJECT = { data: { status: "active" } };
     if (!flow) {
       const reply =
@@ -192,6 +204,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
+    // Decrypt real request
     let clean = {};
     try {
       if (aesKey && ivBuf) {
@@ -207,6 +220,7 @@ export default async function handler(req, res) {
       clean = {};
     }
 
+    // Probe wrapped in crypto? -> return HC ok
     if (clean && (clean.action === "ping" || clean.action === "health_check")) {
       const reply =
         aesKey && ivBuf
@@ -216,23 +230,47 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // ---------- DATA EXCHANGE: compute next & send navigate (with close_flow on terminals) ----------
-    const nextScreen = decideNextScreen(clean);
-    const isTerminal = TERMINAL_SCREENS.has(nextScreen);
+    // If request came FROM a terminal screen (Finish button), close the flow.
+    if (TERMINAL_SCREENS.has(clean?.screen)) {
+      const closePayload = {
+        version: clean?.version || "3.0",
+        data: { status: "success" },
+        close_flow: true
+      };
+      const closeReply =
+        aesKey && ivBuf
+          ? gcmEncryptToB64(aesKey, invert(ivBuf), closePayload)
+          : Buffer.from(JSON.stringify(closePayload)).toString("base64");
+      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", closeReply.length);
+      return sendB64(res, closeReply);
+    }
 
-    const navigatePayload = {
-      version: clean?.version || "3.0",
-      screen: nextScreen,
-      data: {},                 // add any vars you want to pass forward
-      close_flow: isTerminal    // <-- THIS closes the flow so the progress bar completes
-    };
+    // Otherwise, compute next screen & navigate; if the next is terminal, also close.
+    const nextScreen = decideNextScreen(clean);
+    const nextIsTerminal = TERMINAL_SCREENS.has(nextScreen);
+
+    let payload;
+    if (nextIsTerminal) {
+      // Final hop: omit "screen" and set close_flow true so client finishes
+      payload = {
+        version: clean?.version || "3.0",
+        data: { status: "success" },
+        close_flow: true
+      };
+      log("FLOW: NAVIGATE → terminal close", nextScreen);
+    } else {
+      payload = {
+        version: clean?.version || "3.0",
+        screen: nextScreen,
+        data: {}
+      };
+      log("FLOW: NAVIGATE →", nextScreen);
+    }
 
     const reply =
       aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), navigatePayload)
-        : Buffer.from(JSON.stringify(navigatePayload)).toString("base64");
-
-    log("FLOW: NAVIGATE →", nextScreen, "terminal?", isTerminal, "replyLen", reply.length);
+        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+        : Buffer.from(JSON.stringify(payload)).toString("base64");
 
     // Fire-and-forget forward to Power Automate
     try {
@@ -243,11 +281,12 @@ export default async function handler(req, res) {
           body: JSON.stringify(clean)
         }).catch(() => {});
       }
-    } catch {}
+    } catch {/* ignore */}
 
     return sendB64(res, reply);
   } catch (e) {
     log("FLOW: handler error", e?.message || e);
+    // Safety fallback keeps client alive
     const fallback = Buffer.from(JSON.stringify({ data: { status: "success" } })).toString("base64");
     return sendB64(res, fallback);
   }

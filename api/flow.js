@@ -1,167 +1,137 @@
-import { createPrivateKey, createPublicKey } from "node:crypto";
+import { createPrivateKey } from "node:crypto";
 import { compactDecrypt, CompactEncrypt, importSPKI } from "jose";
 
-const toJSON = (res, obj) => {
-  res.setHeader("Content-Type", "application/json");
-  return res.status(200).send(JSON.stringify(obj));
-};
-const toText = (res, text) => {
-  res.setHeader("Content-Type", "text/plain");
-  return res.status(200).send(text);
-};
-const toBase64 = (bufOrStr) =>
-  Buffer.isBuffer(bufOrStr)
-    ? Buffer.from(bufOrStr).toString("base64")
-    : Buffer.from(String(bufOrStr)).toString("base64");
+const toJSON = (res, obj) => { res.setHeader("Content-Type","application/json"); return res.status(200).send(JSON.stringify(obj)); };
+const toText = (res, txt) => { res.setHeader("Content-Type","text/plain"); return res.status(200).send(txt); };
+const b64 = (x) => Buffer.from(typeof x === "string" ? x : String(x)).toString("base64");
 
-/** Try to read Meta's public key for encrypting our response (Health check) */
-async function extractMetaPublicKey(req, body) {
-  // Common header variants seen in the wild:
-  const h = req.headers || {};
-  const headerCandidates = [
+async function findMetaPubKey(req, body) {
+  const H = req.headers || {};
+
+  // Try common header names
+  const headerNames = [
     "x-meta-public-key",
     "x-waba-public-key",
     "x-whatsapp-public-key",
-    "x-meta-healthcheck-key"
+    "x-meta-healthcheck-key",
+    "x-wa-public-key",
   ];
+  for (const name of headerNames) {
+    const val = H[name];
+    if (typeof val === "string" && val.includes("BEGIN PUBLIC KEY")) {
+      try { return await importSPKI(val, "RSA-OAEP-256"); } catch {}
+    }
+  }
 
-  for (const k of headerCandidates) {
-    const val = h[k];
-    if (val && typeof val === "string" && val.includes("BEGIN PUBLIC KEY")) {
+  // Try Base64-encoded PEM in headers
+  const headerB64 = ["x-meta-public-key-b64","x-waba-public-key-b64","x-wa-public-key-b64"];
+  for (const name of headerB64) {
+    const v = H[name];
+    if (typeof v === "string") {
       try {
-        return await importSPKI(val, "RSA-OAEP-256");
+        const pem = Buffer.from(v, "base64").toString("utf8");
+        if (pem.includes("BEGIN PUBLIC KEY")) return await importSPKI(pem, "RSA-OAEP-256");
       } catch {}
     }
   }
 
-  // Body variants (some tenants put it in the test payload):
+  // Try body fields
   const bodyCandidates = [
     body?.meta_public_key_pem,
+    body?.public_key_pem,
     body?.health_check?.public_key_pem,
-    body?.public_key_pem
   ];
-  for (const val of bodyCandidates) {
-    if (val && typeof val === "string" && val.includes("BEGIN PUBLIC KEY")) {
-      try {
-        return await importSPKI(val, "RSA-OAEP-256");
-      } catch {}
-    }
-  }
-
-  // If key is base64-encoded PEM without headers:
-  const headerB64Candidates = [
-    "x-meta-public-key-b64",
-    "x-waba-public-key-b64"
-  ];
-  for (const k of headerB64Candidates) {
-    const val = h[k];
-    if (val && typeof val === "string") {
-      try {
-        const pem = Buffer.from(val, "base64").toString("utf8");
-        if (pem.includes("BEGIN PUBLIC KEY")) {
-          return await importSPKI(pem, "RSA-OAEP-256");
-        }
-      } catch {}
+  for (const v of bodyCandidates) {
+    if (typeof v === "string" && v.includes("BEGIN PUBLIC KEY")) {
+      try { return await importSPKI(v, "RSA-OAEP-256"); } catch {}
     }
   }
 
   return null;
 }
 
-/** Encrypt an object to Meta using RSA-OAEP-256 + A256GCM, then Base64-encode the compact JWE */
-async function encryptForMeta(metaPubKey, obj) {
-  const payload = Buffer.from(JSON.stringify(obj));
-  // jose CompactEncrypt defaults to A256GCM when you set enc to 'A256GCM'
+async function encryptHealthAck(pubKey) {
+  const payload = Buffer.from(JSON.stringify({ ok: true }));
   const jwe = await new CompactEncrypt(payload)
     .setProtectedHeader({ alg: "RSA-OAEP-256", enc: "A256GCM" })
-    .encrypt(metaPubKey);
-  // Health check expects the **HTTP body** to be Base64 of the compact JWE string
-  return toBase64(jwe);
+    .encrypt(pubKey);
+  return b64(jwe); // Health check expects Base64(JWE)
 }
 
 export default async function handler(req, res) {
   try {
-    // Quick GET: show that the function is alive
     if (req.method === "GET") return toJSON(res, { status: "ok" });
     if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-    // Parse body safely (Vercel usually gives you JSON already)
-    let body = (req.body && typeof req.body === "object") ? req.body : {};
+    // Robust parse
+    let body = req.body && typeof req.body === "object" ? req.body : {};
     if (!Object.keys(body).length) {
-      const raw = await new Promise((resolve) => {
-        let data = "";
-        req.on("data", (c) => (data += c));
-        req.on("end", () => resolve(data));
-      });
+      const raw = await new Promise((r)=>{ let d=""; req.on("data",(c)=>d+=c); req.on("end",()=>r(d)); });
       try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
     }
 
-    // 1) Signing challenge
-    if (body.challenge) {
-      return toJSON(res, { challenge: body.challenge });
-    }
+    // Challenge echo
+    if (body?.challenge) return toJSON(res, { challenge: body.challenge });
 
-    // 2) Health check path
-    const looksLikeHealth =
+    // Heuristic: health probe
+    const isHealth =
       req.headers["x-meta-health-check"] === "1" ||
       body?.type === "health_check" ||
       body?.health_check === true ||
-      // many health checks have no business payload at all:
-      (!body.encrypted_flow_data &&
-        !body.encrypted_flow_data_v2 &&
-        !body?.data?.encrypted_flow_data &&
-        Object.keys(body).length <= 2); // very small test body
+      (!body.encrypted_flow_data && !body.encrypted_flow_data_v2 && !body?.data?.encrypted_flow_data && Object.keys(body).length <= 2);
 
-    if (looksLikeHealth) {
+    if (isHealth) {
+      // Optional debug: log headers/body to find the key field
+      if (process.env.LOG_HEALTH_DEBUG === "1") {
+        console.log("META HEALTH DEBUG: headers=", JSON.stringify(req.headers || {}, null, 2).slice(0, 6000));
+        console.log("META HEALTH DEBUG: body=", JSON.stringify(body || {}, null, 2).slice(0, 4000));
+      }
+
       try {
-        const metaPubKey = await extractMetaPublicKey(req, body);
-        if (metaPubKey) {
-          const b64Jwe = await encryptForMeta(metaPubKey, { ok: true });
-          return toText(res, b64Jwe);
+        const pub = await findMetaPubKey(req, body);
+        if (pub) {
+          const resp = await encryptHealthAck(pub);
+          return toText(res, resp);
         }
       } catch (e) {
         console.error("Health encrypt error:", e?.message || e);
       }
-      // Fallback: plain Base64 'ok' (older tenants)
-      return toText(res, toBase64("ok"));
+      // Fallback for older tenants (will fail “decrypt response” but helps us iterate)
+      return toText(res, b64("ok"));
     }
 
-    // 3) Normal Flow traffic — decrypt if JWE present
-    const jweField =
+    // Normal traffic: decrypt if JWE present (ignore errors)
+    const jwe =
       body.encrypted_flow_data ||
       body.encrypted_flow_data_v2 ||
       body?.data?.encrypted_flow_data ||
       null;
 
-    let decrypted = null;
-    if (jweField && process.env.FLOW_PRIVATE_PEM) {
+    if (jwe && process.env.FLOW_PRIVATE_PEM) {
       try {
-        const privateKey = createPrivateKey(process.env.FLOW_PRIVATE_PEM);
-        const { plaintext } = await compactDecrypt(jweField, privateKey);
-        decrypted = JSON.parse(new TextDecoder().decode(plaintext));
+        const { plaintext } = await compactDecrypt(jwe, createPrivateKey(process.env.FLOW_PRIVATE_PEM));
+        body = JSON.parse(new TextDecoder().decode(plaintext));
       } catch (e) {
         console.error("Decryption error:", e?.message || e);
       }
     }
 
-    // 4) Forward (clean or raw) to Power Automate
-    const forwardBody = decrypted || body;
+    // Forward to Power Automate
     if (process.env.MAKE_WEBHOOK_URL) {
       try {
         await fetch(process.env.MAKE_WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(forwardBody)
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
         });
       } catch (e) {
         console.error("Forward failed:", e?.message || e);
       }
     }
 
-    // 5) ACK; optional: you can return an encrypted navigate here too
     return res.status(200).end();
-  } catch (err) {
-    console.error("Handler error:", err?.message || err);
-    return res.status(200).end(); // avoid retries
+  } catch (e) {
+    console.error("Handler error:", e?.message || e);
+    return res.status(200).end();
   }
 }

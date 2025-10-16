@@ -58,9 +58,8 @@ function decodeIv(iv) {
   }
   return null;
 }
-const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i=0;i<b.length;i++) o[i]=buf[i]^0xff; return o; };
+const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i=0;i<buf.length;i++) o[i]=buf[i]^0xff; return o; };
 
-/* AES-GCM helpers */
 function gcmEncryptToB64(key, iv, payload) {
   const bits = key.length * 8;
   const c = crypto.createCipheriv(`aes-${bits}-gcm`, key, iv);
@@ -107,22 +106,41 @@ function getMaterials(b) {
 }
 
 /* --------------- flow logic --------------- */
-const START_SCREEN_ID = "ask_nps";
+// Terminals (only needed if you still have Finish buttons)
+const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
 
+// Start screen config & fallbacks
+const ENV_START = (process.env.FLOW_START_SCREEN || "").trim();
+const START_CANDIDATES = [ENV_START, "ask_nps", "start", "welcome", "home"].filter(Boolean);
+
+function chooseStartScreen(lastTried) {
+  // First pick env value if set, otherwise candidates.
+  const idx = Math.max(START_CANDIDATES.indexOf(lastTried), -1);
+  const next = START_CANDIDATES[(idx + 1) % START_CANDIDATES.length];
+  return next || "ask_nps";
+}
+
+function nextScreen(clean) {
+  const scr = clean?.screen;
+  const d = clean?.data || {};
+  if (scr === "ask_nps") {
+    const s = Number(d.score ?? d.nps_score ?? "-1");
+    if (!Number.isNaN(s) && s >= 8) return "end_positive";
+    return "discuss_invite";
+  }
+  if (scr === "discuss_invite") {
+    if (d.discuss === "discuss_yes") return "end_discuss_yes";
+    if (d.discuss === "discuss_no")  return "end_no";
+  }
+  return scr || (ENV_START || "ask_nps");
+}
+
+/* --------------- payload builders (echo flow_token & version) --------------- */
 function echoVersion(v) { return typeof v === "number" ? v : (typeof v === "string" ? v : "3.0"); }
 function withCommonFields(clean, obj) {
   if (typeof clean?.flow_token !== "undefined") obj.flow_token = clean.flow_token;
   obj.version = echoVersion(clean?.version);
   return obj;
-}
-
-function shouldAutoClose(clean) {
-  // Auto-close immediately after the last actionable step:
-  // 1) ask_nps Submit (any score)
-  // 2) discuss_invite choice (Yes or No)
-  if (clean?.screen === "ask_nps" && clean?.action === "data_exchange") return true;
-  if (clean?.screen === "discuss_invite" && clean?.action === "data_exchange") return true;
-  return false;
 }
 
 /* ------------------- handler ------------------- */
@@ -147,7 +165,7 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Public-key signing challenge
+    // Key-signing challenge
     if (typeof body.challenge === "string") {
       return sendJSON(res, { challenge: body.challenge });
     }
@@ -178,23 +196,26 @@ export default async function handler(req, res) {
         clean = gcmDecryptJson(aesKey, ivBuf, flow);
         log("FLOW: decrypted keys", Object.keys(clean || {}));
         try { log("FLOW: decrypted payload preview", JSON.stringify(clean).slice(0, 1500)); } catch {}
+      } else {
+        log("FLOW: cannot decrypt (missing materials)");
       }
     } catch (e) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // Start ping (no screen) → first screen
+    // ---------- RUNTIME START PING (no screen) -> navigate to configured/next candidate ----------
     if (clean && clean.action === "ping" && !clean.screen) {
-      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
+      const start = chooseStartScreen(null);
+      const payload = withCommonFields(clean, { screen: start, data: {} });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: START →", START_SCREEN_ID);
+      log("FLOW: START → navigate to", start);
       return sendB64(res, reply);
     }
 
-    // health_check probe (encrypted)
-    if (clean && clean.action === "health_check") {
+    // ---------- Encrypted health_check probe ----------
+    if (clean && clean.action === "health_check")) {
       const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
@@ -202,50 +223,37 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Client navigate error callback → recover to start screen
+    // ---------- RECOVER: client "navigate" error callback ----------
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
-      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
+      // Try next candidate start screen to recover from stale ID
+      const lastTried = clean?.data?.last_tried_start || ENV_START || "ask_nps";
+      const nextStart = chooseStartScreen(lastTried);
+      const payload = withCommonFields(clean, { screen: nextStart, data: { last_tried_start: nextStart } });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: RECOVER →", START_SCREEN_ID);
+      log("FLOW: RECOVER navigate-error →", nextStart, "(was:", lastTried, ")");
       return sendB64(res, reply);
     }
 
-    // ---------- AUTO-CLOSE HERE ----------
-    if (shouldAutoClose(clean)) {
-      // Let your automation send a *chat message* "Thanks for your time" after this (outside the Flow).
-      const payload = withCommonFields(clean, { data: { status: "success" }, close_flow: true });
+    // ---------- Terminal request (Finish) -> close (if you still use terminal screens) ----------
+    if (TERMINAL_SCREENS.has(clean?.screen)) {
+      const payload = withCommonFields(clean, { screen: clean.screen, data: { status: "success" }, close_flow: true });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-
-      // Fire-and-forget forward to your automation with a small flag so it can send the thank-you message
-      try {
-        if (process.env.MAKE_WEBHOOK_URL) {
-          const forward = { ...clean, event: "flow_closed" };
-          fetch(process.env.MAKE_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(forward)
-          }).catch(() => {});
-        }
-      } catch {}
-
-      log("FLOW: AUTO-CLOSE from", clean.screen);
+      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen);
       return sendB64(res, reply);
     }
 
-    // Otherwise, navigate to next step (only needed if you still keep intermediate screens)
-    // In our lean auto-close setup:
-    // ask_nps → auto-close
-    // discuss_invite → auto-close
-    // So any other path just goes back to start for safety.
-    const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
+    // ---------- Normal navigate ----------
+    const next = nextScreen(clean);
+    const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf
       ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
       : Buffer.from(JSON.stringify(payload)).toString("base64");
-    log("FLOW: fallback NAVIGATE →", START_SCREEN_ID);
+    log("FLOW: NAVIGATE →", next);
+
     return sendB64(res, reply);
 
   } catch (e) {

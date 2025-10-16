@@ -25,7 +25,7 @@ async function readBody(req) {
 }
 
 /* --------------- crypto ------------------ */
-const VALID_AES = new Set([16, 24, 32]); // bytes (128/192/256)
+const VALID_AES = new Set([16, 24, 32]); // 128/192/256-bit AES keys (bytes)
 const TAG_LEN = 16;
 
 const isHex = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
@@ -108,6 +108,7 @@ function getMaterials(b) {
 /* --------------- flow logic --------------- */
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
 const START_SCREEN_ID = (process.env.FLOW_START_SCREEN || "ask_nps").trim();
+const PING_MODE = (process.env.FLOW_PING_MODE || "health").trim().toLowerCase(); // "health" | "navigate"
 
 function nextScreen(clean) {
   const scr = clean?.screen;
@@ -154,7 +155,7 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Key-signing challenge
+    // Public-key challenge echo
     if (typeof body.challenge === "string") {
       return sendJSON(res, { challenge: body.challenge });
     }
@@ -178,7 +179,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Decrypt real request
+    // Decrypt
     let clean = {};
     try {
       if (aesKey && ivBuf) {
@@ -192,27 +193,37 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // Start ping (no screen) → first screen
-    if (clean && clean.action === "ping" && !clean.screen) {
-      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
-      const reply = aesKey && ivBuf
-        ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
-        : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: START → navigate to", START_SCREEN_ID);
-      return sendB64(res, reply);
-    }
-
-    // Encrypted health_check probe
-    if (clean && clean.action === "health_check") {
+    // -------- Encrypted health probe --------
+    if (clean && (clean.action === "health_check")) {
       const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: PROBE reply (HC) len", reply.length);
+      log("FLOW: PROBE reply (HC)");
       return sendB64(res, reply);
     }
 
-    // Client navigate error callback → recover to start screen
+    // -------- Encrypted "ping" handling (switchable) --------
+    if (clean && clean.action === "ping" && !clean.screen) {
+      if (PING_MODE === "navigate") {
+        const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
+        const reply = aesKey && ivBuf
+          ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+          : Buffer.from(JSON.stringify(payload)).toString("base64");
+        log("FLOW: START → navigate to", START_SCREEN_ID);
+        return sendB64(res, reply);
+      } else {
+        // default: behave like Health Check
+        const payload = withCommonFields(clean, { data: { status: "active" } });
+        const reply = aesKey && ivBuf
+          ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
+          : Buffer.from(JSON.stringify(payload)).toString("base64");
+        log("FLOW: START → HC_OK (PING_MODE=health)");
+        return sendB64(res, reply);
+      }
+    }
+
+    // -------- Client navigate error callback → recover --------
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
       const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
@@ -222,19 +233,19 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Terminal request (user tapped Finish) → close
-    if (TERMINAL_SCREENS.has(clean?.screen)) {
+    // -------- Terminal request (Finish) → close --------
+    if (TERMINAL_SCREENS.has(clean?.screen) && clean?.action === "data_exchange") {
       const payload = withCommonFields(clean, {
-        screen: clean.screen,            // some tenants expect screen echoed
+        screen: clean.screen,
         data: { status: "success" },
         close_flow: true
       });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", reply.length);
+      log("FLOW: CLOSE reply (from terminal)", clean?.screen);
 
-      // Forward to Power Automate (awaited for status logging)
+      // Forward to Power Automate (awaited for visibility)
       try {
         if (process.env.MAKE_WEBHOOK_URL) {
           const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -251,7 +262,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // Normal navigate (including into terminal screens) → return screen (NO close yet)
+    // -------- Normal navigate (into next screen) --------
     const next = nextScreen(clean);
     const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf

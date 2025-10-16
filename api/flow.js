@@ -58,7 +58,7 @@ function decodeIv(iv) {
   }
   return null;
 }
-const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i=0;i<buf.length;i++) o[i]=buf[i]^0xff; return o; };
+const invert = (buf) => { const o = Buffer.alloc(buf.length); for (let i = 0; i < buf.length; i++) o[i] = buf[i] ^ 0xff; return o; };
 
 function gcmEncryptToB64(key, iv, payload) {
   const bits = key.length * 8;
@@ -106,19 +106,8 @@ function getMaterials(b) {
 }
 
 /* --------------- flow logic --------------- */
-// Terminals (only needed if you still have Finish buttons)
 const TERMINAL_SCREENS = new Set(["end_no", "end_positive", "end_discuss_yes"]);
-
-// Start screen config & fallbacks
-const ENV_START = (process.env.FLOW_START_SCREEN || "").trim();
-const START_CANDIDATES = [ENV_START, "ask_nps", "start", "welcome", "home"].filter(Boolean);
-
-function chooseStartScreen(lastTried) {
-  // First pick env value if set, otherwise candidates.
-  const idx = Math.max(START_CANDIDATES.indexOf(lastTried), -1);
-  const next = START_CANDIDATES[(idx + 1) % START_CANDIDATES.length];
-  return next || "ask_nps";
-}
+const START_SCREEN_ID = (process.env.FLOW_START_SCREEN || "ask_nps").trim();
 
 function nextScreen(clean) {
   const scr = clean?.screen;
@@ -132,7 +121,7 @@ function nextScreen(clean) {
     if (d.discuss === "discuss_yes") return "end_discuss_yes";
     if (d.discuss === "discuss_no")  return "end_no";
   }
-  return scr || (ENV_START || "ask_nps");
+  return scr || START_SCREEN_ID;
 }
 
 /* --------------- payload builders (echo flow_token & version) --------------- */
@@ -203,56 +192,87 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // ---------- RUNTIME START PING (no screen) -> navigate to configured/next candidate ----------
+    // Start ping (no screen) → first screen
     if (clean && clean.action === "ping" && !clean.screen) {
-      const start = chooseStartScreen(null);
-      const payload = withCommonFields(clean, { screen: start, data: {} });
+      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: START → navigate to", start);
+      log("FLOW: START → navigate to", START_SCREEN_ID);
       return sendB64(res, reply);
     }
 
-    // ---------- Encrypted health_check probe ----------
-    if (clean && clean.action === "health_check")) {
+    // Encrypted health_check probe
+    if (clean && clean.action === "health_check") {
       const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
+      log("FLOW: PROBE reply (HC) len", reply.length);
       return sendB64(res, reply);
     }
 
-    // ---------- RECOVER: client "navigate" error callback ----------
+    // Client navigate error callback → recover to start screen
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
-      // Try next candidate start screen to recover from stale ID
-      const lastTried = clean?.data?.last_tried_start || ENV_START || "ask_nps";
-      const nextStart = chooseStartScreen(lastTried);
-      const payload = withCommonFields(clean, { screen: nextStart, data: { last_tried_start: nextStart } });
+      const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: RECOVER navigate-error →", nextStart, "(was:", lastTried, ")");
+      log("FLOW: RECOVER navigate-error →", START_SCREEN_ID);
       return sendB64(res, reply);
     }
 
-    // ---------- Terminal request (Finish) -> close (if you still use terminal screens) ----------
+    // Terminal request (user tapped Finish) → close
     if (TERMINAL_SCREENS.has(clean?.screen)) {
-      const payload = withCommonFields(clean, { screen: clean.screen, data: { status: "success" }, close_flow: true });
+      const payload = withCommonFields(clean, {
+        screen: clean.screen,            // some tenants expect screen echoed
+        data: { status: "success" },
+        close_flow: true
+      });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen);
+      log("FLOW: CLOSE reply (from terminal screen)", clean?.screen, "len", reply.length);
+
+      // Forward to Power Automate (awaited for status logging)
+      try {
+        if (process.env.MAKE_WEBHOOK_URL) {
+          const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(clean)
+          });
+          log("FLOW: forwarded to Power Automate status", resp.status);
+        }
+      } catch (e) {
+        log("FLOW: forward error", e?.message || e);
+      }
+
       return sendB64(res, reply);
     }
 
-    // ---------- Normal navigate ----------
+    // Normal navigate (including into terminal screens) → return screen (NO close yet)
     const next = nextScreen(clean);
     const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf
       ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
       : Buffer.from(JSON.stringify(payload)).toString("base64");
+
     log("FLOW: NAVIGATE →", next);
+
+    // Forward to Power Automate (awaited for visibility)
+    try {
+      if (process.env.MAKE_WEBHOOK_URL) {
+        const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(clean)
+        });
+        log("FLOW: forwarded to Power Automate status", resp.status);
+      }
+    } catch (e) {
+      log("FLOW: forward error", e?.message || e);
+    }
 
     return sendB64(res, reply);
 

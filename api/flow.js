@@ -125,7 +125,7 @@ function nextScreen(clean) {
   return scr || START_SCREEN_ID;
 }
 
-/* --------------- payload builders (echo flow_token & version) --------------- */
+/* --------------- payload builders --------------- */
 function echoVersion(v) { return typeof v === "number" ? v : (typeof v === "string" ? v : "3.0"); }
 function withCommonFields(clean, obj) {
   if (typeof clean?.flow_token !== "undefined") obj.flow_token = clean.flow_token;
@@ -155,7 +155,7 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // Public-key challenge echo
+    // Public-key challenge
     if (typeof body.challenge === "string") {
       return sendJSON(res, { challenge: body.challenge });
     }
@@ -193,17 +193,17 @@ export default async function handler(req, res) {
       log("FLOW: decrypt error", e?.message || e);
     }
 
-    // -------- Encrypted health probe --------
-    if (clean && (clean.action === "health_check")) {
+    // Encrypted health probe
+    if (clean && clean.action === "health_check") {
       const payload = withCommonFields(clean, { data: { status: "active" } });
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: PROBE reply (HC)");
+      log("FLOW: PROBE reply (HC) len", reply.length);
       return sendB64(res, reply);
     }
 
-    // -------- Encrypted "ping" handling (switchable) --------
+    // Encrypted start ping
     if (clean && clean.action === "ping" && !clean.screen) {
       if (PING_MODE === "navigate") {
         const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
@@ -213,7 +213,6 @@ export default async function handler(req, res) {
         log("FLOW: START → navigate to", START_SCREEN_ID);
         return sendB64(res, reply);
       } else {
-        // default: behave like Health Check
         const payload = withCommonFields(clean, { data: { status: "active" } });
         const reply = aesKey && ivBuf
           ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
@@ -223,7 +222,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // -------- Client navigate error callback → recover --------
+    // Recovery path
     if (clean && clean.action === "navigate" && (!clean.screen || clean.data?.error)) {
       const payload = withCommonFields(clean, { screen: START_SCREEN_ID, data: {} });
       const reply = aesKey && ivBuf
@@ -233,7 +232,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // -------- Terminal request (Finish) → close --------
+    // Close on terminal Finish (end screens have Close button that triggers data_exchange)
     if (TERMINAL_SCREENS.has(clean?.screen) && clean?.action === "data_exchange") {
       const payload = withCommonFields(clean, {
         screen: clean.screen,
@@ -243,9 +242,9 @@ export default async function handler(req, res) {
       const reply = aesKey && ivBuf
         ? gcmEncryptToB64(aesKey, invert(ivBuf), payload)
         : Buffer.from(JSON.stringify(payload)).toString("base64");
-      log("FLOW: CLOSE reply (from terminal)", clean?.screen);
+      log("FLOW: CLOSE reply (terminal)", clean?.screen);
 
-      // Forward to Power Automate (awaited for visibility)
+      // Forward to Power Automate
       try {
         if (process.env.MAKE_WEBHOOK_URL) {
           const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
@@ -262,7 +261,7 @@ export default async function handler(req, res) {
       return sendB64(res, reply);
     }
 
-    // -------- Normal navigate (into next screen) --------
+    // Normal navigate (into next screen, including terminals)
     const next = nextScreen(clean);
     const payload = withCommonFields(clean, { screen: next, data: {} });
     const reply = aesKey && ivBuf
@@ -271,7 +270,7 @@ export default async function handler(req, res) {
 
     log("FLOW: NAVIGATE →", next);
 
-    // Forward to Power Automate (awaited for visibility)
+    // Forward to Power Automate
     try {
       if (process.env.MAKE_WEBHOOK_URL) {
         const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
